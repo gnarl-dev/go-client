@@ -1,0 +1,5 @@
+# The generated layer IS committed — a `go get` must work without a
+# generator toolchain. Only local build artefacts are ignored.
+/dist/
+*.test
+*.out

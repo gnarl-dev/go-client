@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          # The generated layer is excluded: it is gofmt'd by the generator,
+          # and reformatting it by hand would be undone on the next run.
+          unformatted=$(gofmt -l . | grep -v '^internal/oas/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+      - run: go test ./... -race
+
+  conformance:
+    # The layer that matters. Compiling proves the types match the
+    # description; only this proves the description matches the server.
+    name: conformance against a real node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+
+      - name: Fetch a node
+        run: |
+          set -euo pipefail
+          tag=$(curl -fsSL https://api.github.com/repos/lucenia/lucenia/releases/latest \
+                | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          echo "using $tag"
+          curl -fsSL -o node.tar.gz \
+            "https://github.com/lucenia/lucenia/releases/download/$tag/lucenia-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf node.tar.gz
+          # A node runs JVM-free on the native engine, so no Java is needed.
+          echo "GNARL_BINARY=$PWD/lucenia" >> "$GITHUB_ENV"
+
+      - name: Conformance
+        run: go test ./conformance/... -v
+
+  spec-drift:
+    # The generated layer must match the description it claims to come from.
+    # A hand-edit here is how a client silently stops matching the server.
+    name: generated layer is in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+      - run: go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest
+      - name: Regenerate and diff
+        run: |
+          cd internal/oas
+          oapi-codegen -config config.yaml openapi.yaml
+          cd ../..
+          if ! git diff --exit-code -- internal/oas/oas.gen.go; then
+            echo
+            echo "internal/oas/oas.gen.go does not match openapi.yaml."
+            echo "It is generated — edit the spec and run: go generate ./internal/oas"
+            exit 1
+          fi

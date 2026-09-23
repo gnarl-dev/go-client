@@ -1,0 +1,15 @@
+# Models ONLY, deliberately.
+#
+# The generated *client* wraps every call in a per-operation result struct
+# (SearchResult{JSON200,JSON400,...}) which is exactly what makes a generated
+# SDK unpleasant to hold — and those wrappers collide by name with the schemas
+# they wrap (BulkIndexResponse, IndexDocumentResponse, GetDocumentResponse),
+# producing a package that does not compile while oapi-codegen still exits 0.
+#
+# The payload TYPES are what we want from the spec: they cannot drift, because
+# they are regenerated. Transport and ergonomics are hand-written in the root
+# package, where they can be idiomatic.
+package: oas
+output: oas.gen.go
+generate:
+  models: true

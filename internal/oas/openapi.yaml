@@ -1,0 +1,3362 @@
+openapi: 3.1.0
+info:
+  title: Lucenia Public Data API
+  version: 1.1.0
+  description: |
+    Public developer API for Lucenia — a decentralized search engine.
+
+    This is the **only** public HTTP contract. Peer fan-out lives under
+    `/internal/*` (ed25519 peer auth) and is not part of this document.
+    The legacy `/v0/*` data and control planes have been removed; clients
+    must use `/v1/*`.
+
+    ## Auth model (two deployment modes)
+
+    - **Open / People's Search (default):** no Bearer token required. The
+      data plane is intentionally open for zero-trust internet-scale search.
+      Integrity of writes on the public mesh is a protocol/tokenomics concern,
+      not per-user RBAC. Nodes apply **in-process per-IP rate limiting** on
+      `/v1` index routes by default (`--http-rate-limit`); discovery /
+      liveness / `/internal/*` are not limited by this layer. Edge LB/WAF
+      limits remain complementary.
+    - **Private mesh (opt-in):** start with `--mesh-scope private`. RBAC is
+      turned on **by default** in this scope (`cli/full.rs`: "Private mesh
+      turns RBAC on by default") — `--enable-rbac` is not required, and a
+      non-loopback caller without a token gets `401`. Requests from loopback
+      are exempt so the bundled Console and local MCP work without a token.
+      TLS is on by default unless `--no-tls`. Clients send
+      `Authorization: Bearer <capability-token>`. Roles: `reader` < `writer` <
+      `admin`. Namespace erase and BYOK key register/revoke require `admin`.
+
+    ## Error shapes a client must handle
+
+    **Every JSON error is one shape**: `{"error": {"type": ..., "reason": ...}}`
+    — `ErrorResponse`. That holds for every `/v1` route: index, namespace,
+    document, search, snapshot, memory, and the middleware layers (rate
+    limiting, RBAC). One error type in a generated client is enough.
+
+    Two notes for client authors:
+
+    - `error.message` is still emitted alongside `error.reason`, carrying
+      identical text. It is a **deprecated alias** kept so readers written
+      before `reason` existed keep working. New code reads `reason`; the
+      alias will be removed in a future major version.
+    - **Plain text, `422 Unprocessable Entity`** — emitted by the HTTP
+      framework's own body deserializer when a request body does not match
+      the declared type at all (a wrong query shape, a missing required
+      field). It answers before any handler runs, so it is `text/plain`, e.g.
+      `Failed to deserialize the JSON body into the target type: ...`.
+      It is NOT JSON and carries no `error` key. A client parsing error
+      bodies must check the content type, or treat a non-JSON `422` as a
+      client-side request-shape bug.
+
+    Design principles:
+    - ES-inspired, not ES-compatible
+    - All query behavior must be explicit in the request or schema
+    - No implicit analyzer selection, field resolution, or scoring defaults
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+
+servers:
+  - url: https://localhost:8080
+    description: Local node (TLS on by default)
+  - url: http://localhost:8080
+    description: Local node with --no-tls
+
+# Empty = open by default. Private-mesh operators apply BearerAuth per operation
+# or globally when --enable-rbac is on.
+security: []
+
+tags:
+  - name: indexes
+    description: Index lifecycle management
+  - name: documents
+    description: Document indexing and retrieval
+  - name: search
+    description: Query execution
+  - name: memory
+    description: >
+      Agent memory — durable recall for assistants. `remember` stores a fact,
+      `recall` retrieves by hybrid lexical+vector search, `answer` composes
+      over what was recalled, and the `ingest/*` routes accept documents,
+      chat transcripts and voice.
+  - name: node
+    description: >
+      Node introspection and operations. Read endpoints are safe to poll and
+      are what an operator or a supervisor script should use.
+  - name: discovery
+    description: Peer discovery and mesh membership.
+  - name: snapshots
+    description: >
+      Backup and restore. Register a repository (a directory, or an
+      S3-compatible bucket — which includes Google Cloud Storage through its
+      interoperability endpoint), then take, list, restore and delete snapshots
+      in it. Every route here requires the `admin` role: restoring writes over
+      live data, deleting destroys a backup, and registering a repository
+      decides where this node's data is copied to. Snapshot, restore and
+      cleanup are long-running, so they return `202` with a job id and run one
+      at a time per node.
+  - name: namespaces
+    description: >
+      Namespaces — many lightweight tenants over bounded physical pools
+      ("name it and write"). Intended for private-mesh multi-tenant apps.
+      A namespace is a filtered alias over a shared pool by default; declaring
+      a dense_vector mapping or promoting it moves the namespace to its own
+      dedicated index.
+
+# ---------------------------------------------------------------------------
+# What this contract covers
+# ---------------------------------------------------------------------------
+#
+# EVERY `/v1` route this node serves is either documented below or listed here
+# as deliberately outside the contract. Nothing is undocumented by accident —
+# CI fails when an implemented route is neither (see "OpenAPI drift" in ci.yml).
+#
+# NOT covered by the compatibility promise, and versioned with the Console
+# rather than with the API:
+#
+#   /v1/node/settings/*     Console settings surface (models, folders, mesh,
+#                           resources, updates, vision, chat, agent-connect)
+#   /v1/chat/*              Console chat threads, attachments, completions
+#   /v1/node/restart        Console-initiated restart
+#   /v1/node/mesh/invite    Console invite issue/redeem — the pairing flow,
+#   /v1/node/mesh/join      shipped in lockstep with the UI that drives it
+#
+# These are served by the same binary as the UI that consumes them and change
+# together with it. Freezing them as a public contract would make the Console
+# unable to evolve; leaving them undocumented would make the contract a lie.
+# So they are named, and excluded, on purpose.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+
+  # --- Index management ---------------------------------------------------
+
+  /v1/indexes:
+    get:
+      operationId: listIndexes
+      tags: [indexes]
+      summary: List indexes, one page at a time
+      parameters:
+        - $ref: "#/components/parameters/ListAfter"
+        - $ref: "#/components/parameters/ListLimit"
+      responses:
+        "200":
+          description: Index list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexListResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/indexes/{name}:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    put:
+      operationId: createIndex
+      tags: [indexes]
+      summary: Create an index with schema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateIndexRequest"
+      responses:
+        "201":
+          description: Index created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexMetadata"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Index already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/UnsupportedEngineError"
+
+    get:
+      operationId: getIndex
+      tags: [indexes]
+      summary: Get index metadata
+      responses:
+        "200":
+          description: Index metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexMetadata"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+    delete:
+      operationId: deleteIndex
+      tags: [indexes]
+      summary: Delete an index
+      responses:
+        "200":
+          description: Index deleted
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+  /v1/indexes/{name}/_schema:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    get:
+      operationId: getSchema
+      tags: [indexes]
+      summary: Get index schema
+      responses:
+        "200":
+          description: Index schema with field definitions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexSchema"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+  # --- Document operations ------------------------------------------------
+
+  /v1/indexes/{name}/_doc:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+      - $ref: "#/components/parameters/WaitFor"
+      - $ref: "#/components/parameters/WaitForTimeoutMs"
+      - $ref: "#/components/parameters/IdempotencyKey"
+
+    post:
+      operationId: indexDocument
+      tags: [documents]
+      summary: Index a single document
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexDocumentRequest"
+      responses:
+        "201":
+          description: Document indexed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexDocumentResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+  /v1/indexes/{name}/_doc/{doc_id}:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+      - $ref: "#/components/parameters/DocId"
+
+    get:
+      operationId: getDocument
+      tags: [documents]
+      summary: Get a document by ID
+      responses:
+        "200":
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetDocumentResponse"
+        "404":
+          description: Document or index not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    delete:
+      operationId: deleteDocument
+      tags: [documents]
+      summary: Delete a document by ID
+      responses:
+        "200":
+          description: Document deleted
+        "404":
+          description: Document or index not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/indexes/{name}/_bulk:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+      - $ref: "#/components/parameters/WaitFor"
+      - $ref: "#/components/parameters/WaitForTimeoutMs"
+      - $ref: "#/components/parameters/IdempotencyKey"
+
+    post:
+      operationId: bulkIndex
+      tags: [documents]
+      summary: Bulk index documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkIndexRequest"
+      responses:
+        "200":
+          description: Bulk operation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkIndexResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+  /v1/indexes/{name}/_bulk_stream:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    post:
+      operationId: bulkStreamIndex
+      tags: [documents]
+      summary: Streaming NDJSON bulk index
+      description: |
+        Accepts newline-delimited JSON (NDJSON) action-document pairs.
+        Each pair is an action line followed by a document line.
+        Action: `{"index":{"_id":"optional-id"}}`, Document: `{"field":"value"}`.
+        Streams micro-batches to the engine — does not buffer the full payload.
+      parameters:
+        - $ref: "#/components/parameters/WaitFor"
+        - $ref: "#/components/parameters/WaitForTimeoutMs"
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Bulk stream result with per-item status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkStreamResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+        "415":
+          description: Content-Type must be application/x-ndjson
+
+  /v1/indexes/{name}/_bulk_proto:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    post:
+      operationId: bulkProtoIndex
+      tags: [documents]
+      summary: Protobuf bulk index with optional zstd compression
+      description: |
+        Accepts a BulkIngestRequest protobuf message. Binary encoding is
+        ~2-5x more compact than JSON; optional zstd compression adds
+        another 3-10x reduction. Ideal for vector-heavy or high-throughput
+        programmatic ingest. Response is JSON (same shape as _bulk_stream).
+      parameters:
+        - name: Content-Encoding
+          in: header
+          schema:
+            type: string
+            enum: [zstd, identity]
+          description: Optional compression. zstd recommended for large payloads.
+        - name: wait_for
+          in: query
+          schema:
+            type: string
+            enum: [durable]
+        - name: wait_for_timeout_ms
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Bulk result with per-item status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkStreamResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+        "413":
+          description: Request body too large (max 64 MB)
+        "415":
+          description: Content-Type must be application/x-protobuf
+
+  # --- Search -------------------------------------------------------------
+
+  /v1/indexes/{name}/_search:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    post:
+      operationId: searchIndex
+      tags: [search]
+      summary: Search an index
+      description: |
+        Only POST is supported. Complex DSL queries do not fit naturally
+        in query parameters.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+        "422":
+          $ref: "#/components/responses/UnsupportedCapabilityError"
+
+  # --- Namespaces ---------------------------------------------------------
+
+  /v1/namespaces/{ns}/_doc:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+      - $ref: "#/components/parameters/WaitFor"
+      - $ref: "#/components/parameters/WaitForTimeoutMs"
+    post:
+      operationId: indexNamespaceDocument
+      tags: [namespaces]
+      summary: Write a document to a namespace
+      description: >
+        Implicitly creates the namespace on first write (dynamic mapping). The
+        document is isolated to this namespace.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexDocumentRequest"
+      responses:
+        "201":
+          description: Document indexed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexDocumentResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/namespaces/{ns}/_bulk:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+      - $ref: "#/components/parameters/WaitFor"
+      - $ref: "#/components/parameters/WaitForTimeoutMs"
+    post:
+      operationId: bulkIndexNamespaceDocuments
+      tags: [namespaces]
+      summary: Write many documents to a namespace
+      description: >
+        Batch equivalent of `_doc`, and the path to use for a tenant import:
+        one request pays routing, fencing and the visibility wait once for the
+        whole batch instead of once per document, and counts as one request
+        against the rate limit.
+
+
+        Implicitly creates the namespace on first write, inferring the mapping
+        from the whole batch. Each `_id` is optional and minted when absent, and
+        the ids returned are the tenant's own — never the internal namespace
+        scoped form. Documents are isolated to this namespace exactly as they
+        are through `_doc`; `_namespace` is server-assigned and cannot be set by
+        a client.
+
+
+        HTTP status is always 200 — per-item `status` carries success or
+        failure, and item order matches request order. A partial accept is
+        reported as an error for every item rather than as success, so a client
+        retries (idempotent by `_id`) instead of silently losing documents.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkIndexRequest"
+      responses:
+        "200":
+          description: Bulk result — inspect per-item status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkIndexResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Namespace is keyed but locked — supply the key first
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/namespaces/{ns}/_search:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+    post:
+      operationId: searchNamespace
+      tags: [namespaces]
+      summary: Search within a namespace
+      description: >
+        Results are restricted to this namespace by a mandatory, non-overridable
+        `_namespace` filter. A kNN query requires a dedicated (vector) namespace;
+        a kNN query on a pooled namespace is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/namespaces/{ns}/_doc/{doc_id}:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+      - $ref: "#/components/parameters/DocId"
+    get:
+      operationId: getNamespaceDocument
+      tags: [namespaces]
+      summary: Fetch a document from a namespace
+      responses:
+        "200":
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetDocumentResponse"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+    delete:
+      operationId: deleteNamespaceDocument
+      tags: [namespaces]
+      summary: Delete a document from a namespace
+      responses:
+        "200":
+          description: Delete result
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+  /v1/namespaces/{ns}/_mapping:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+    put:
+      operationId: putNamespaceMapping
+      tags: [namespaces]
+      summary: Declare an explicit namespace mapping (dense_vector)
+      description: >
+        Declares a dense_vector field for a namespace, materializing it as its
+        own dedicated index (bound to the native-ds engine) so vector kNN is
+        single-tenant isolated. Requires a fresh namespace (no pooled data);
+        scalar-only mappings are rejected (scalars are inferred on write).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexSchema"
+      responses:
+        "200":
+          description: Mapping applied; the namespace is now dedicated
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Namespace already has pooled data, or a promotion is in progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/namespaces/{ns}/_promote:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+    post:
+      operationId: promoteNamespace
+      tags: [namespaces]
+      summary: Promote a pooled namespace to a dedicated index
+      description: >
+        Online migration (dual-write + backfill + cutover + purge) — no lost
+        writes, isolation preserved. Idempotent.
+      responses:
+        "200":
+          description: Promotion result
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /v1/namespaces/{ns}/_key:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+    put:
+      operationId: putNamespaceKey
+      tags: [namespaces]
+      summary: Register or unlock a namespace BYOK key
+      description: >
+        Registers a tenant Key-Encryption-Key (KEK) or unlocks an already-keyed
+        namespace on this node. Body is `{"key":"<base64-32-bytes>"}`.
+        With RBAC enabled (private mesh), requires `admin`. Searchable terms
+        remain plaintext by design; `_source` is enveloped.
+      security:
+        - BearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  description: Base64-encoded 32-byte KEK
+      responses:
+        "200":
+          description: Key status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceKeyStatus"
+        "403":
+          description: Wrong KEK or RBAC forbidden
+    get:
+      operationId: getNamespaceKeyStatus
+      tags: [namespaces]
+      summary: Namespace encryption status
+      description: Reports keyed/unlocked state. Never returns key material.
+      security:
+        - BearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: Key status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceKeyStatus"
+    delete:
+      operationId: deleteNamespaceKey
+      tags: [namespaces]
+      summary: Revoke namespace key (crypto-erase)
+      description: >
+        Revokes the wrapped DEK and leaves a fail-closed tombstone.
+        With RBAC enabled (private mesh), requires `admin`.
+      security:
+        - BearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: Revocation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceKeyStatus"
+
+  /v1/namespaces/{ns}:
+    parameters:
+      - $ref: "#/components/parameters/NamespaceName"
+    delete:
+      operationId: deleteNamespace
+      tags: [namespaces]
+      summary: Delete a whole namespace
+      description: >
+        Removes every document belonging to the namespace and clears DHT key
+        material. With RBAC enabled (private mesh), requires `admin` — writers
+        may fill a namespace but must not erase a tenant.
+      security:
+        - BearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: Delete result
+          content:
+            application/json:
+              schema:
+                type: object
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+  # --- Node introspection -------------------------------------------------
+
+  /v1/node/status:
+    get:
+      operationId: nodeStatus
+      tags: [node]
+      summary: Node identity, peers, claims and mode
+      description: >
+        The first thing to poll. `claims` is the number of claim units this
+        node currently serves; it going to zero after an index is deleted is
+        the invariant the churn gate asserts.
+      responses:
+        "200":
+          description: Current node state
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - node_id
+                  - peers
+                  - reachable_peers
+                  - claims
+                  - serving_ready
+                  - proof_verified
+                  - mode
+                  - load
+                  - connectivity
+                  - admission
+                  - storage
+                properties:
+                  node_id: { type: string, description: 64-char hex }
+                  peers: { type: integer }
+                  reachable_peers: { type: integer }
+                  claims: { type: integer }
+                  serving_ready: { type: integer }
+                  proof_verified: { type: integer }
+                  mode: { type: string, enum: [private, public, lan, dev-mesh, single-node] }
+                  data_dir:
+                    type: string
+                    description: >
+                      Absolute path to this node's data directory. Absent only
+                      for ephemeral in-memory nodes.
+                  load:
+                    type: object
+                    description: Local load signal — threads against the soft ceiling.
+                    required: [threads, soft_max, saturated]
+                    properties:
+                      threads: { type: integer }
+                      soft_max: { type: integer }
+                      saturated: { type: boolean }
+                  connectivity:
+                    type: object
+                    additionalProperties: true
+                    description: >
+                      Bootstrap and cloud-relay (DERP) readiness for CGNAT/WAN
+                      joins: `mesh_scope`, `bootstrap_enabled`,
+                      `cloud_relay_enabled`, `cloud_relay_connected`,
+                      `relay_candidates`, `join_mode_active`,
+                      `local_cgnat_interface`, `observed_addrs`, `join_hint`.
+                  admission:
+                    type: object
+                    additionalProperties: true
+                    description: >
+                      Peer-admission posture: `mesh_scope`, `policy`,
+                      `allowlist_size`, `identity_fence`, `rbac_is_orthogonal`,
+                      `admission_hint`.
+                  storage:
+                    type: object
+                    additionalProperties: true
+                    description: >
+                      Durability honesty: `segment_backend`, `segments_dir`,
+                      `cold_tier`, `object_store`, `wal_durability`,
+                      `desired_replicas`, `accept_replica_duty`, `used_bytes`,
+                      the three `*_budget_enforced` flags, and `storage_hint`.
+
+  /v1/node/stats:
+    get:
+      operationId: nodeStats
+      tags: [node]
+      summary: Counters for queries, ingest and storage
+      responses:
+        "200":
+          description: Node counters
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/node/egress:
+    get:
+      operationId: nodeEgress
+      tags: [node]
+      summary: Outbound gossip bytes by message type
+      description: >
+        What this node is putting on the wire, broken down by mesh message type
+        and sorted heaviest first, since the process started.
+
+
+        It exists because idle mesh traffic can dominate a fleet's cost while
+        being invisible from the node: answering "what is producing this" once
+        required interface counters on every machine, and even then gave only a
+        total. `sends` counts messages, `bytes` counts encoded payload.
+      responses:
+        "200":
+          description: Egress totals and the per-type breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_bytes: { type: integer, format: int64 }
+                  by_type:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        message_type: { type: string }
+                        sends: { type: integer, format: int64 }
+                        bytes: { type: integer, format: int64 }
+
+  /v1/node/peers:
+    get:
+      operationId: nodePeers
+      tags: [node]
+      summary: Known peers with reachability and RTT
+      description: >
+        Per-peer health as this node sees it: `status`, `rtt_ewma_ms`,
+        `health_ping_rtt_ms`, `recent_failure_count`, and the addresses it will
+        try. Addresses may be IPv4 or IPv6; a dual-stack peer reports both.
+      responses:
+        "200":
+          description: Peer table snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        node_id: { type: string }
+                        status: { type: string }
+                        addr: { type: string, description: "UDP address, e.g. [2600:1900::]:43301" }
+                        http_addr: { type: string }
+                        rtt_ewma_ms: { type: number, format: double }
+                        recent_failure_count: { type: integer }
+
+  /v1/node/explain:
+    get:
+      operationId: nodeExplain
+      tags: [node]
+      summary: Why this node is configured the way it is
+      description: Resolved settings and the reason each was chosen — for support and bug reports.
+      responses:
+        "200":
+          description: Explanation of effective configuration
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/node/version:
+    get:
+      operationId: nodeVersion
+      tags: [node]
+      summary: Build version
+      responses:
+        "200":
+          description: Version information
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/node/updates/check:
+    get:
+      operationId: nodeUpdatesCheck
+      tags: [node]
+      summary: Whether a newer release is available
+      responses:
+        "200":
+          description: Update availability
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/node/contribution:
+    get:
+      operationId: nodeContribution
+      tags: [node]
+      summary: What this node has contributed to the mesh
+      responses:
+        "200":
+          description: Contribution counters
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/node/mesh:
+    get:
+      operationId: nodeMesh
+      tags: [discovery]
+      summary: Mesh scope, name and membership state
+      responses:
+        "200":
+          description: Mesh membership
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/bootstrap/discover:
+    get:
+      operationId: bootstrapDiscover
+      tags: [discovery]
+      summary: Advertise this node and learn peers
+      description: >
+        The discovery handshake a joining node performs. Also the endpoint the
+        loopback dev-mesh scan probes. Safe to call unauthenticated; it returns
+        no index data.
+      responses:
+        "200":
+          description: This node's discovery record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string }
+                  mesh_name: { type: string }
+                  declared_addrs:
+                    type: array
+                    items: { type: string }
+
+  # --- Index operations ---------------------------------------------------
+
+  /v1/indexes/{name}/_count:
+    get:
+      operationId: countDocuments
+      tags: [search]
+      summary: Document count for an index
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+      responses:
+        "200":
+          description: Count, with coverage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, partial]
+                properties:
+                  count: { type: integer }
+                  partial:
+                    type: boolean
+                    description: >
+                      True when this node did not count every claim of the
+                      index — because some claims are owned elsewhere, or a
+                      local claim's engine or WAL had not finished
+                      materializing. A count with `partial: true` is a FLOOR,
+                      not an answer.
+
+
+                      Note the scope: `_count` counts the claims THIS node
+                      holds. On a multi-node mesh it is this node's slice, and
+                      `partial` is how you know.
+        "404": { description: No such index }
+
+  /v1/indexes/{name}/_route:
+    get:
+      operationId: explainRouting
+      tags: [indexes]
+      summary: Which claim and node a document id routes to
+      description: >
+        Deterministic routing is `claim_ids[blake3(id) % claim_ids.len()]`; this
+        exposes the result for a given id, which is how routing bugs get
+        diagnosed without reading logs on every node.
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Routing decision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [found]
+                properties:
+                  found: { type: boolean }
+                  cost:
+                    type: integer
+                    description: Route cost. Absent when `found` is false.
+
+  /v1/indexes/{name}/_forcemerge:
+    post:
+      operationId: forceMerge
+      tags: [indexes]
+      summary: Merge segments
+      description: Expensive and I/O-heavy; intended for a quiet period, not a hot path.
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+        - name: max_num_segments
+          in: query
+          required: false
+          description: Target segments per claim. Defaults to 1; values below 1 are raised to 1.
+          schema: { type: integer, minimum: 1, default: 1 }
+      responses:
+        "200":
+          description: Merge accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [segments, partial]
+                properties:
+                  segments:
+                    type: integer
+                    description: Segment count after the merge, across locally-held claims.
+                  partial:
+                    type: boolean
+                    description: >
+                      True when some of the index's claims are not local to
+                      this node — only the local ones were merged.
+
+  /v1/indexes/{name}/_graph/build:
+    post:
+      operationId: buildGraph
+      tags: [indexes]
+      summary: Build the graph projection for an index
+      parameters:
+        - $ref: "#/components/parameters/IndexName"
+      responses:
+        "200":
+          description: Build accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nodes, edges, fill_in, partial]
+                properties:
+                  nodes: { type: integer }
+                  edges: { type: integer }
+                  fill_in:
+                    type: boolean
+                    description: Custom-metric fill-in phase. Always false for a CCH build.
+                  partial:
+                    type: boolean
+                    description: >
+                      True when some of the index's claims are not local to
+                      this node — only the local ones were built.
+
+  # --- Namespaces ---------------------------------------------------------
+
+  /v1/namespaces:
+    get:
+      operationId: listNamespaces
+      tags: [namespaces]
+      summary: List namespaces and their promotion state, one page at a time
+      parameters:
+        - $ref: "#/components/parameters/ListAfter"
+        - $ref: "#/components/parameters/ListLimit"
+      responses:
+        "200":
+          description: Namespaces known to this node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  namespaces:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, promotion, keyed]
+                      properties:
+                        name: { type: string }
+                        promotion: { type: string, enum: [pooled, migrating, dedicated] }
+                        keyed: { type: boolean, description: True when BYOK is registered }
+                        unlocked:
+                          type: boolean
+                          description: >
+                            Present and true when the tenant KEK has been
+                            supplied to this node this session (keyed
+                            namespaces only). Absent means false.
+                  next_after:
+                    type: string
+                    description: >
+                      Cursor for the next page. Absent once the listing is
+                      complete.
+                  partial:
+                    type: boolean
+                    description: >
+                      Present and true when a peer could not be reached, so this
+                      page is a floor rather than a complete answer.
+
+
+                      The catalog is written by whichever node served a
+                      namespace's first write and is not replicated, so the
+                      listing merges every node's view. An unreachable peer
+                      means namespaces may be missing; absent means the whole
+                      mesh answered.
+
+  # --- Agent memory -------------------------------------------------------
+
+  /v1/memory/remember:
+    post:
+      operationId: memoryRemember
+      tags: [memory]
+      summary: Store a memory
+      description: >
+        Embeds `content` and stores it in the space resolved from
+        `space`/`namespace`/`user`. On a node with no on-device model and no
+        route to fetch one, this fails fast with a `Download` error naming
+        where to install the model — it does not hang.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                space: { type: string }
+                namespace: { type: string }
+                user: { type: string }
+                session: { type: string }
+                agent: { type: string }
+                fact_type: { type: string }
+                pinned: { type: boolean }
+                tags: { type: object, additionalProperties: { type: string } }
+                url: { type: string }
+                title: { type: string }
+                source: { type: string }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                required: [id, namespace, user, embedder]
+                properties:
+                  id:
+                    type: string
+                    description: The memory's id (UUID).
+                  namespace: { type: string }
+                  user: { type: string }
+                  embedder:
+                    type: string
+                    description: >
+                      Which embedder produced the vector, as a human-readable
+                      descriptor, e.g.
+                      `local_minilm(dim=384, semantic=true, offline=true)`.
+                  engine_binding: { type: string }
+        "400":
+          description: Bad request — e.g. empty content, or an unresolvable space
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500":
+          description: Embedding unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/memory/recall:
+    post:
+      operationId: memoryRecall
+      tags: [memory]
+      summary: Recall memories by hybrid lexical + vector search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                namespace: { type: string }
+                space: { type: string }
+                user: { type: string }
+                session: { type: string }
+                k:
+                  type: integer
+                  default: 5
+                  maximum: 100
+                  description: |
+                    How many memories to return. Values above 100 are CLAMPED
+                    to 100, not rejected — so a caller asking for 500 receives
+                    100 and should not read that as "there were only 100".
+                limit:
+                  type: integer
+                  description: |
+                    Accepted as an alias for `k`; `k` wins if both are given.
+                    This name was published here before it was implemented, so
+                    it is honoured rather than removed.
+      responses:
+        "200":
+          description: Ranked memories
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                required: [namespace, count, memories, embedder]
+                properties:
+                  namespace: { type: string }
+                  count:
+                    type: integer
+                    description: Number of entries in `memories`.
+                  embedder: { type: string }
+                  memories:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      required: [id, score, content]
+                      properties:
+                        id: { type: string }
+                        score:
+                          type: number
+                          format: float
+                          description: Fused hybrid score (lexical + vector).
+                        knn_score:
+                          type: number
+                          format: float
+                          description: The vector leg's score before fusion.
+                        content: { type: string }
+                        fact_type: { type: [string, "null"] }
+                        pinned: { type: boolean }
+                        created:
+                          type: string
+                          format: date-time
+                        session: { type: [string, "null"] }
+                        agent: { type: [string, "null"] }
+                        tags:
+                          type: string
+                          description: >
+                            Tags as a flat `k=v,k=v` STRING, not an object —
+                            the shape the request's `tags` object is flattened
+                            into on the way out.
+        "400":
+          description: Bad request — e.g. an empty query, or an unresolvable namespace
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500":
+          description: Embedding unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/memory/answer:
+    post:
+      operationId: memoryAnswer
+      tags: [memory]
+      summary: Answer a question over recalled memories
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                namespace: { type: string }
+                k:
+                  type: integer
+                  default: 5
+                  description: How many memories to retrieve before composing.
+                limit:
+                  type: integer
+                  description: Alias for `k`; `k` wins if both are given.
+      responses:
+        "200":
+          description: Answer with the memories it drew on
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/memory/bootstrap:
+    post:
+      operationId: memoryBootstrap
+      tags: [memory]
+      summary: Prepare a memory space
+      responses:
+        "200":
+          description: Space ready
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/memory/ingest/document:
+    post:
+      operationId: memoryIngestDocument
+      tags: [memory]
+      summary: Ingest a document into memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Ingested
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/memory/ingest/messages:
+    post:
+      operationId: memoryIngestMessages
+      tags: [memory]
+      summary: Ingest a chat transcript into memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Ingested
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/memory/ingest/voice:
+    post:
+      operationId: memoryIngestVoice
+      tags: [memory]
+      summary: Ingest transcribed voice into memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Ingested
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v1/repositories:
+    get:
+      operationId: listRepositories
+      tags: [snapshots]
+      summary: List registered repositories
+      description: >
+        Credentials are never returned. The access key id is, because it
+        identifies which credential is in use without being a secret.
+      responses:
+        "200":
+          description: The repositories registered on this node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repositories:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RegisteredRepository"
+
+  /v1/repositories/{repo}:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+        description: The repository's name on this node.
+
+    put:
+      operationId: registerRepository
+      tags: [snapshots]
+      summary: Register a repository
+      description: >
+        The repository is opened and listed before it is accepted, so a wrong
+        bucket or a bad credential fails here rather than inside a scheduled
+        backup where nobody reads the response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RepositorySpec"
+      responses:
+        "201":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisteredRepository"
+        "200":
+          description: An existing registration was replaced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisteredRepository"
+        "400":
+          description: The repository could not be opened or did not answer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    get:
+      operationId: getRepository
+      tags: [snapshots]
+      summary: Get one repository
+      responses:
+        "200":
+          description: The repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisteredRepository"
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    delete:
+      operationId: unregisterRepository
+      tags: [snapshots]
+      summary: Forget a repository
+      description: >
+        Removes the registration only. The repository's data is left alone —
+        deleting someone's backups as a side effect of tidying a config would
+        not be recoverable.
+      responses:
+        "200":
+          description: Unregistered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  unregistered: { type: boolean }
+                  note: { type: string }
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/repositories/{repo}/_cleanup:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+
+    post:
+      operationId: cleanupRepository
+      tags: [snapshots]
+      summary: Reclaim segments no snapshot references
+      description: >
+        Marks from every descriptor, then sweeps. If any descriptor cannot be
+        read the sweep is abandoned and nothing is deleted, because one
+        unreadable descriptor makes everything it references look unreferenced.
+        Objects younger than the grace period are never collected: a snapshot
+        writes its segments before its descriptor, so a sweep that ignored age
+        would delete the segments of a snapshot still in flight.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_seconds:
+                  type: integer
+                  description: Objects younger than this are kept. Default 86400.
+      responses:
+        "202":
+          description: Cleanup started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotJob"
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Another snapshot job is already running on this node
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/repositories/{repo}/snapshots:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+
+    get:
+      operationId: listSnapshots
+      tags: [snapshots]
+      summary: List the snapshots in a repository
+      responses:
+        "200":
+          description: Snapshot names
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  snapshots:
+                    type: array
+                    items: { type: string }
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/repositories/{repo}/snapshots/{snapshot}:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+      - name: snapshot
+        in: path
+        required: true
+        schema: { type: string }
+
+    put:
+      operationId: createSnapshot
+      tags: [snapshots]
+      summary: Take a snapshot of an index or a promoted namespace
+      description: >
+        Give either `index` or `namespace`.
+
+
+        A namespace is logical, so HOW it is captured depends on how it is
+        stored — and the job result reports which was used, as `kind`.
+
+
+        A PROMOTED namespace has a dedicated physical index and is captured
+        exactly: segments copied, pinned per claim.
+
+
+        A POOLED namespace shares its segments with every other namespace that
+        hashes into the same pool, so it has no physical subset of its own. Its
+        DOCUMENTS are exported instead (`kind: logical`). That capture is exact
+        in content but is NOT a point-in-time cut — it walks a live index, so a
+        document written during the walk may or may not be included — and it
+        restores by re-ingesting rather than by putting bytes back. Promote the
+        namespace when exactness matters. A keyed namespace exports with its
+        `_source` still sealed; the tenant's key is never needed to take the
+        backup and never reaches it.
+
+
+        Snapshotting a `__pool_N` index by NAME is different again: it captures
+        every namespace stored in it, and therefore requires
+        `allow_shared_pool`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "202":
+          description: Snapshot started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotJob"
+        "400":
+          description: Neither or both of index and namespace, or an unacknowledged shared pool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: >
+            The namespace is pooled or mid-promotion, or another job is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    get:
+      operationId: getSnapshot
+      tags: [snapshots]
+      summary: Get a snapshot's descriptor
+      description: >
+        Includes `signature_verified`, which says whether this node could check
+        the descriptor's signature against a key it independently trusts — its
+        own, or a known peer's. A descriptor that merely parses proves nothing.
+      responses:
+        "200":
+          description: The descriptor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotDescriptor"
+        "404":
+          description: No such repository or snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    delete:
+      operationId: deleteSnapshot
+      tags: [snapshots]
+      summary: Delete a snapshot
+      description: >
+        Deletes the descriptor only. Segments are shared between snapshots, so
+        reclaiming them is `_cleanup`'s job, judged against every snapshot that
+        survives, never a side effect of one deletion.
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  snapshot: { type: string }
+                  deleted: { type: boolean }
+                  note: { type: string }
+        "404":
+          description: No such repository or snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/repositories/{repo}/snapshots/{snapshot}/_restore:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+      - name: snapshot
+        in: path
+        required: true
+        schema: { type: string }
+
+    post:
+      operationId: restoreSnapshot
+      tags: [snapshots]
+      summary: Restore a snapshot
+      description: >
+        Refuses by default to restore a snapshot whose signer this node cannot
+        verify — one signed by neither this node nor a known mesh peer. Supply
+        `signer_public_key`, or set `allow_unverified_signer` to accept it
+        deliberately.
+
+
+        Restoring a namespace snapshot also routes the namespace back at its
+        dedicated index. Without that the documents would be restored and
+        invisible, because namespace queries route by promotion state rather
+        than by what is on disk.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "202":
+          description: Restore started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotJob"
+        "400":
+          description: The supplied signer key does not match or does not verify
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No such repository or snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Unverifiable signer, or another job is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/snapshot_jobs:
+    get:
+      operationId: listSnapshotJobs
+      tags: [snapshots]
+      summary: List snapshot jobs, newest first
+      description: >
+        History is durable across restarts. A job that was RUNNING when the
+        node stopped is reopened as `failed`, because whether it finished is
+        unknown — list the repository to see what it actually wrote.
+      responses:
+        "200":
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SnapshotJob"
+
+  /v1/snapshot_jobs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+
+    get:
+      operationId: getSnapshotJob
+      tags: [snapshots]
+      summary: Get one snapshot job
+      responses:
+        "200":
+          description: The job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotJob"
+        "404":
+          description: No such job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: lucenia-capability-token
+      description: >
+        Ed25519-signed capability token issued by the private-mesh RBAC issuer
+        (`lucenia rbac issue`). Required only when the node was started with
+        `--enable-rbac`. Open/People's Search meshes leave this unused.
+
+  # --- Parameters ---------------------------------------------------------
+
+  parameters:
+    ListAfter:
+      name: after
+      in: query
+      required: false
+      description: >
+        Exclusive cursor: the `next_after` of the previous page. Omit for the
+        first page.
+      schema: { type: string }
+    ListLimit:
+      name: limit
+      in: query
+      required: false
+      description: >
+        Entries per page. Defaults to 1000, capped at 10000. A page may hold
+        fewer entries than requested — system indexes are hidden after the page
+        is cut — so follow `next_after` until it is absent rather than stopping
+        at the first short page.
+      schema: { type: integer, minimum: 1, maximum: 10000 }
+    IndexName:
+      name: name
+      in: path
+      required: true
+      description: |
+        Index name: 1–64 characters of lowercase alphanumerics, hyphens and
+        underscores, not starting with `_` or `-`. A leading `_` is reserved
+        for system indexes such as the namespace pools (`__pool_N`), which is
+        what keeps a user index from ever colliding with one.
+      schema:
+        type: string
+        # Matches IndexName::new. A leading DIGIT is allowed — the previous
+        # `^[a-z]` rejected names the server accepts — and the ceiling is 64,
+        # not 128: a generated client validating against 128 would accept a
+        # name the server then refuses.
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+        minLength: 1
+        maxLength: 64
+
+    DocId:
+      name: doc_id
+      in: path
+      required: true
+      description: Document identifier
+      schema:
+        type: string
+        minLength: 1
+
+    NamespaceName:
+      name: ns
+      in: path
+      required: true
+      description: |
+        Namespace name. Same rules as an index name, because a namespace
+        resolves to one: 1–64 characters of lowercase alphanumerics, hyphens
+        and underscores, not a reserved pool prefix.
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+        minLength: 1
+        maxLength: 64
+
+    WaitFor:
+      name: wait_for
+      in: query
+      required: false
+      description: |
+        Requested ingest acknowledgement. `visible` (or
+        `visible_for_search`) returns only after the written claims are
+        immediately searchable. `durable` returns after the written claims
+        have reached the durable sequence. `accepted` disables waiting.
+      schema:
+        type: string
+        enum: [accepted, durable, visible, visible_for_search]
+
+    WaitForTimeoutMs:
+      name: wait_for_timeout_ms
+      in: query
+      required: false
+      description: Maximum time to wait for the requested acknowledgement.
+      schema:
+        type: integer
+        minimum: 1
+        default: 30000
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional opaque client key (≤128 characters) for sticky document
+        identity on ingest. The same key on the same index binds the same
+        `_id`(s) so Ambiguous→heal→retry upserts LWW instead of minting a
+        second UUID. Reusing a key with a different request body (or `_id`
+        binding) returns 409. Ambiguous / 503 / partial-accept outcomes leave
+        the key incomplete so a retry may re-enter; only successful accepts
+        are marked completed for optional response replay.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+
+  # --- Reusable responses -------------------------------------------------
+
+  responses:
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: validation_error
+              reason: "Missing required field 'query'"
+
+    IndexNotFoundError:
+      description: Index does not exist
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: index_not_found
+              reason: "Index 'products' does not exist"
+
+    UnsupportedCapabilityError:
+      description: Query requires a capability the field lacks
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: unsupported_capability
+              reason: "Field 'location' does not support query type 'match'"
+              detail:
+                field: location
+                field_type: geo_point
+                query_type: match
+                required_capability: FullTextSearchable
+                available_capabilities:
+                  - Filterable
+                  - GeoQueryable
+                  - Sortable
+                  - Storable
+
+    UnsupportedEngineError:
+      description: Field type valid in model but engine cannot execute
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: unsupported_engine
+              reason: "Field type 'geo_point' is not supported by the current engine"
+              detail:
+                field: location
+                field_type: geo_point
+                engine: tantivy
+
+    RateLimited:
+      description: >
+        Client exceeded the per-IP in-process rate limit on the data plane.
+        Includes `Retry-After` (seconds). Tune with `--http-rate-limit` /
+        `--http-rate-limit-burst`, or disable with `--no-http-rate-limit`.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: rate_limited
+              reason: "too many requests from this client; retry later"
+              message: "too many requests from this client; retry later"
+              detail:
+                retry_after_seconds: 1
+                limit_requests_per_minute: 600
+                burst: 60
+
+  # --- Schemas ------------------------------------------------------------
+
+  schemas:
+
+    RepositorySpec:
+      type: object
+      description: >
+        Where a repository's bytes live. `fs` is a directory; `s3` is any
+        S3-compatible bucket, which includes AWS S3, MinIO, Ceph, Cloudflare R2
+        and Google Cloud Storage through its interoperability endpoint.
+        Setting `encryption_key` seals every object written, so the store holds
+        ciphertext only; losing that key loses the backup.
+      oneOf:
+        - $ref: "#/components/schemas/FsRepositorySpec"
+        - $ref: "#/components/schemas/S3RepositorySpec"
+      discriminator:
+        propertyName: type
+
+    FsRepositorySpec:
+      type: object
+      required: [type, location]
+      properties:
+        type: { type: string, enum: [fs] }
+        location:
+          type: string
+          description: Directory holding the repository.
+        encryption_key:
+          type: string
+          description: 32-byte repository key, hex. Never returned.
+
+    S3RepositorySpec:
+      type: object
+      required: [type, endpoint, bucket, region, access_key_id, secret_access_key]
+      properties:
+        type: { type: string, enum: [s3] }
+        endpoint:
+          type: string
+          description: Scheme and host, e.g. https://s3.us-east-1.amazonaws.com
+        bucket: { type: string }
+        region:
+          type: string
+          description: Signing region. GCS and R2 accept `auto` or `us-east-1`.
+        prefix:
+          type: string
+          description: Key prefix, so one bucket can hold several repositories.
+        access_key_id: { type: string }
+        secret_access_key:
+          type: string
+          description: Never returned by any endpoint.
+        session_token:
+          type: string
+          description: For temporary STS credentials. Never returned.
+        path_style:
+          type: boolean
+          default: true
+          description: >
+            Bucket in the path (`/bucket/key`), which MinIO and most
+            self-hosted stores require. False uses a virtual host.
+        encryption_key:
+          type: string
+          description: 32-byte repository key, hex. Never returned.
+
+    RegisteredRepository:
+      type: object
+      properties:
+        repository: { type: string }
+        spec:
+          type: object
+          description: >
+            The repository's non-secret configuration. Secrets are omitted
+            rather than masked.
+          properties:
+            type: { type: string, enum: [fs, s3] }
+            location: { type: string }
+            endpoint: { type: string }
+            bucket: { type: string }
+            region: { type: string }
+            prefix: { type: string }
+            access_key_id: { type: string }
+            path_style: { type: boolean }
+            encrypted:
+              type: boolean
+              description: Whether objects are sealed with a repository key.
+
+    CreateSnapshotRequest:
+      type: object
+      description: Exactly one of `index` or `namespace`.
+      properties:
+        index:
+          type: string
+          description: A physical index to capture.
+        namespace:
+          type: string
+          description: >
+            A namespace to capture. Only a promoted namespace can be: a pooled
+            one shares its segments with every other namespace in its pool.
+        allow_shared_pool:
+          type: boolean
+          default: false
+          description: >
+            Acknowledge that snapshotting a `__pool_N` index captures every
+            namespace stored in it.
+
+    RestoreRequest:
+      type: object
+      properties:
+        signer_public_key:
+          type: string
+          description: >
+            The signer's ed25519 public key, hex. Must be the key the snapshot
+            names as its signer; both facts are checked.
+        allow_unverified_signer:
+          type: boolean
+          default: false
+          description: >
+            Restore a snapshot this node cannot attribute to itself or to a
+            known peer.
+        allow_overwrite_live_index:
+          type: boolean
+          default: false
+          description: >
+            Roll a LIVE index back to this snapshot. Without it, restoring over
+            an index that is currently serving is refused with `409`: the
+            restore would replace what it serves, and the next query would
+            simply return older data with nothing to say it happened.
+
+    SnapshotJob:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [snapshot, restore, cleanup] }
+        state: { type: string, enum: [running, succeeded, failed] }
+        repository: { type: string }
+        snapshot: { type: string }
+        index:
+          type: string
+          description: The index or namespace the job is acting on.
+        started_at_ms: { type: integer }
+        finished_at_ms: { type: integer }
+        result:
+          type: object
+          description: What the operation produced, once it succeeded.
+        error:
+          type: string
+          description: Why it failed.
+
+    SnapshotDescriptor:
+      type: object
+      description: >
+        What a snapshot IS: the manifests and segment hashes it captured,
+        signed by the node that took it. The signature covers every segment
+        hash, so a repository cannot substitute content.
+      properties:
+        snapshot: { type: string }
+        index_name: { type: string }
+        namespace:
+          type: string
+          description: Set when this is a namespace snapshot.
+        namespace_key:
+          type: object
+          description: >
+            The namespace's BYOK key record, when it has one. Carries the
+            WRAPPED DEK only — sealed under the tenant's KEK, which no node
+            ever holds — because without it the restored `_source` could not be
+            decrypted even by the rightful tenant: re-registering a key mints a
+            different DEK. A restore applies it only when it is at least as new
+            as what the node already knows, so an old snapshot cannot undo a
+            revoke.
+          properties:
+            generation: { type: integer }
+            keyed: { type: boolean }
+            revoked: { type: boolean }
+            wrapped_dek:
+              type: string
+              description: Hex. Useless without the tenant's KEK.
+        index_id: { type: string }
+        index_generation: { type: integer }
+        created_at_ms: { type: integer }
+        signer_node_id: { type: string }
+        segment_count: { type: integer }
+        total_bytes: { type: integer }
+        signature: { type: string }
+        signature_verified:
+          type: boolean
+          description: >
+            Whether this node checked the signature against a key it
+            independently trusts.
+        signature_note:
+          type: string
+          description: Why the signature could not be verified, when it could not.
+        claims:
+          type: array
+          items:
+            type: object
+            properties:
+              claim_unit_id: { type: integer }
+              manifest_id: { type: string }
+              epoch: { type: integer }
+              doc_count: { type: integer }
+              segment_hashes:
+                type: array
+                items: { type: string }
+
+
+    NamespaceKeyStatus:
+      type: object
+      required: [namespace, encrypted, unlocked]
+      properties:
+        namespace:
+          type: string
+          description: The namespace this status describes
+        encrypted:
+          type: boolean
+          description: True when a wrapped DEK is registered for this namespace
+        unlocked:
+          type: boolean
+          description: True when this node holds the unwrapped DEK in memory
+        registered:
+          type: boolean
+          description: Present on PUT — true when this call newly registered the key
+
+    # --- Error contract ---
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+
+    ErrorBody:
+      type: object
+      description: |
+        The structured error body. `type` and `reason` are always present,
+        on every route and from every layer — typed `/v1` handlers, the
+        `/v1/memory/*` family, and the middleware (rate limiting, RBAC).
+        Read `reason`.
+
+
+        `message` is a deprecated alias carrying identical text, emitted so
+        that callers written before `reason` existed keep working. It is
+        not part of the forward contract and will be removed in a future
+        major version.
+      required: [type, reason]
+      properties:
+        type:
+          type: string
+          description: |
+            Stable error type. Part of the v1 contract — new types may
+            be added, existing types will not be removed or renamed.
+          enum:
+            - validation_error
+            - unsupported_capability
+            - unsupported_engine
+            - index_not_found
+            # The index exists but the document does not. Distinct from
+            # index_not_found on purpose: both are 404, but one means a
+            # mapping or deployment problem and the other is the ordinary
+            # answer to looking up a key that is not there.
+            - document_not_found
+            - index_already_exists
+            - field_not_found
+            - schema_error
+            - unauthorized
+            - internal_error
+            - rate_limited
+            - unauthenticated
+            - forbidden
+            - repository_not_found
+            - snapshot_not_found
+            - repository_error
+            - shared_pool
+            - namespace_not_snapshottable
+            - job_in_progress
+            - unverified_signer
+        reason:
+          type: string
+          description: >
+            Human-readable description. Always present. This is the field
+            to read.
+        message:
+          type: string
+          deprecated: true
+          description: >
+            Deprecated alias for `reason`, carrying identical text. Present
+            so callers written before `reason` existed keep working; it will
+            be removed in a future major version. Do not read it in new code.
+        detail:
+          type: object
+          additionalProperties: true
+          description: |
+            Structured detail for capability and engine errors.
+            Shape varies by error type.
+
+    # --- Index management ---
+
+    CreateIndexRequest:
+      type: object
+      required: [schema]
+      properties:
+        schema:
+          $ref: "#/components/schemas/IndexSchema"
+
+    IndexSchema:
+      type: object
+      required: [fields]
+      properties:
+        fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FieldDefinition"
+          description: |
+            Field name → field definition mapping.
+
+            **Four field names are reserved and cannot be declared**:
+            `id`, `version`, `title` and `canonical_url`. They are owned by
+            the document envelope — `id`/`version` are identity, `title`/
+            `canonical_url` are folded into the authenticated record from the
+            document header — so declaring one is rejected at index creation
+            with a `validation_error`, on every engine.
+
+            `title` in particular is a name most search schemas reach for
+            first. Use `name`, `headline` or `subject` instead, and put the
+            canonical title in the document header where the authenticated
+            record picks it up.
+
+    FieldDefinition:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: "#/components/schemas/FieldType"
+        # --- Type-specific options (all optional) ---
+        dimensions:
+          type: integer
+          minimum: 1
+          description: |
+            Vector dimensionality (required for dense_vector and multi_vector).
+            For multi_vector this is the width of ONE token vector — the number
+            of tokens is per-document and is never declared in the mapping.
+        distance_metric:
+          type: string
+          enum: [cosine, dot_product, l2]
+          default: cosine
+          description: Distance function (dense_vector and multi_vector only)
+        quantization:
+          type: string
+          enum: [none, int8, int4, binary]
+          default: none
+          description: |
+            On-disk vector quantization (dense_vector only). `none` stores
+            float32; `int8` is ~4x smaller, `int4` ~8x, `binary` ~32x.
+        taxonomy:
+          type: boolean
+          default: false
+          description: |
+            Taxonomy DAG mode for graph_edge fields — precomputes the
+            transitive closure at flush. Always present on responses,
+            including for field types where it has no effect.
+        format:
+          type: string
+          enum: [strict_date_optional_time, epoch_millis, epoch_nanos]
+          description: |
+            Date format (date fields only). Default: strict_date_optional_time.
+            Controls output format in _source. Ingest always accepts both
+            ISO-8601 strings (nanosecond precision) and epoch milliseconds
+            regardless of format. Internal precision is nanoseconds.
+      description: |
+        Field options configure how a capability is implemented, not
+        whether it exists. For example, `dimensions` and `distance_metric`
+        affect dense_vector execution but do not change the field's
+        capabilities.
+
+    FieldType:
+      type: string
+      description: |
+        Public field type names. Engine support varies — unsupported types
+        fail deterministically at engine-capability validation.
+      enum:
+        - text
+        - keyword
+        - integer
+        - long
+        - float
+        - double
+        - date
+        - boolean
+        - geo_point
+        - geo_shape
+        - point
+        - shape
+        - dense_vector
+        - multi_vector
+        - graph_edge
+
+    IndexMetadata:
+      type: object
+      required: [name, schema, claim_count]
+      properties:
+        name:
+          type: string
+        schema:
+          $ref: "#/components/schemas/IndexSchema"
+        engine_binding:
+          type: string
+          description: |
+            The engine this index is bound to (e.g. `tantivy`). Binding is
+            decided at creation from the schema's field types and is
+            immutable afterwards.
+        created_at:
+          type: string
+          format: date-time
+        claim_count:
+          type: integer
+          minimum: 1
+          description: |
+            Number of claim units this index is spread across — the
+            denominator `coverage.expected_claims` is measured against.
+
+    IndexListResponse:
+      type: object
+      required: [indexes]
+      properties:
+        indexes:
+          type: array
+          items:
+            $ref: "#/components/schemas/IndexMetadata"
+        next_after:
+          type: string
+          description: >
+            Cursor for the next page. Absent once the listing is complete, so a
+            client stops when the field stops appearing.
+
+    # --- Document operations ---
+
+    IndexDocumentRequest:
+      type: object
+      properties:
+        _id:
+          type: string
+          description: |
+            Optional document ID. If omitted, the system generates one.
+      additionalProperties: true
+      description: |
+        Document body. Top-level keys (except _id) are field values
+        that must conform to the index schema.
+
+    IndexDocumentResponse:
+      type: object
+      required: [_id, ack]
+      properties:
+        _id:
+          type: string
+          description: Document ID (provided or generated)
+        ack:
+          type: string
+          enum: [accepted, accepted_durably, visible_for_search]
+          description: |
+            Durability level actually reached, which is what `wait_for`
+            asked for unless the wait timed out. Always present.
+        timed_out:
+          type: boolean
+          description: |
+            Present and true when `wait_for` timed out before the requested
+            level was reached — the write was accepted, but `ack` is weaker
+            than asked for.
+
+    GetDocumentResponse:
+      type: object
+      required: [_id, _source]
+      properties:
+        _id:
+          type: string
+        _source:
+          type: object
+          additionalProperties: true
+          description: The stored document fields
+
+    BulkIndexRequest:
+      type: object
+      required: [documents]
+      properties:
+        documents:
+          type: array
+          items:
+            $ref: "#/components/schemas/IndexDocumentRequest"
+          minItems: 1
+
+    BulkIndexResponse:
+      type: object
+      required: [items, errors, ack]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BulkItemResult"
+        errors:
+          type: boolean
+          description: True if any item failed
+        ack:
+          type: string
+          enum: [accepted, accepted_durably, visible_for_search]
+          description: |
+            Durability level reached for the whole batch. Always present.
+        timed_out:
+          type: boolean
+          description: True if `wait_for` timed out before the requested level was reached.
+
+    BulkItemResult:
+      type: object
+      required: [_id, status]
+      properties:
+        _id:
+          type: string
+        status:
+          type: integer
+          description: HTTP-style status code for this item
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+
+    BulkStreamResponse:
+      type: object
+      required: [took, items, errors, ack]
+      properties:
+        took:
+          type: integer
+          description: Time in milliseconds
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BulkStreamItem"
+        errors:
+          type: boolean
+          description: True if any item failed
+        ack:
+          type: string
+          description: Durability acknowledgment level
+        timed_out:
+          type: boolean
+          description: True if wait_for=durable timed out
+
+    BulkStreamItem:
+      type: object
+      required: [status, seq]
+      properties:
+        _id:
+          type: string
+          description: Document ID (absent for parse errors)
+        status:
+          type: integer
+          description: HTTP-style status code for this item
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+        seq:
+          type: integer
+          description: 0-based position of this pair in the NDJSON input
+
+    # --- Search ---
+
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          $ref: "#/components/schemas/Query"
+        sort:
+          type: array
+          items:
+            $ref: "#/components/schemas/SortClause"
+          description: |
+            Sort order. Defaults to `_score` descending if omitted.
+
+
+            **One sort field.** Sorting by two or more fields is not
+            implemented and is refused with `400 unsupported_engine` rather
+            than partially applied. An `_id` tiebreaker is always appended, so
+            the order is total and stable across claims and repeats.
+
+
+            **Sortable types:** integer/long/float/double, date, and boolean.
+            Keyword and text fields are NOT sortable and are refused with
+            `400 unsupported_capability`. `_score` is always accepted;
+            `_geo_distance` parses but is engine-dependent — see `SortClause`.
+        from:
+          type: integer
+          minimum: 0
+          default: 0
+          description: |
+            Pagination offset. Bounded by `from + size <= 10000`, and the cost
+            grows with the offset because every claim must collect `from + size`
+            rows. Use `search_after` to walk a large result set.
+        search_after:
+          type: array
+          items: {}
+          description: |
+            Keyset pagination cursor: pass the `sort` array from the last hit of
+            the previous page to get the rows after it. Requires an explicit
+            `sort`, and `from` is ignored when present.
+
+
+            Prefer this over `from` for anything deep. The cursor is pushed down
+            to each claim as a range on the first sort key, so a page costs the
+            same whether it is the first or the ten-thousandth, and it is stable
+            under concurrent writes in a way an offset is not.
+
+
+            A caveat worth knowing: documents sharing the cursor's first sort
+            value are fetched and then discarded, so sorting on a field with
+            very long runs of one value can stall a walk. Sort on something
+            reasonably distinct, or add a second sort key.
+        size:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          default: 10
+          description: Maximum number of hits to return
+        _source:
+          oneOf:
+            - type: boolean
+            - type: array
+              items:
+                type: string
+          description: |
+            Control _source field inclusion. `true` (default) returns
+            full source, `false` excludes it, array selects fields.
+        rerank:
+          $ref: "#/components/schemas/Rerank"
+        collapse:
+          $ref: "#/components/schemas/Collapse"
+        track_total_hits:
+          type: boolean
+          description: |
+            Ask for an exact `hits.total` even when `size` is 0 — what a graph
+            traversal that only wants a count asks for. It is a REQUEST, not a
+            guarantee: engines that cannot count the corpus still answer
+            `relation: gte`, so read `hits.total.relation` before trusting
+            `hits.total.value`.
+        profile:
+          type: boolean
+          description: |
+            Include a `profile` block in the response with graph-traversal
+            phase timing (reachability vs materialize), and the fan-out:
+            which peer served each claim, which were skipped and why, and
+            how many nodes answered.
+        verify:
+          type: boolean
+          description: |
+            Require tamper evidence for this search.
+
+            Every served claim must be PROVEN — a proof binding to an anchor
+            the node holds independently of whoever served it. A claim nobody
+            could check then counts against completeness exactly as an
+            unanswered one does, so `verify: true` with `partial: false` means
+            every row returned was proven, and `partial: true` reports which
+            claims were not, in `coverage.skipped_claims`.
+
+            Distinct from asking for complete COVERAGE: that asks whether
+            every claim answered, this asks whether every answer was proven.
+        scope:
+          $ref: "#/components/schemas/QueryScope"
+
+    QueryScope:
+      type: object
+      additionalProperties: false
+      description: Per-query execution bounds.
+      properties:
+        deadline_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            How long a shard may take before it is given up on, in
+            milliseconds, overriding the node's own budget for this query.
+
+            A shard that misses it is skipped and reported in `coverage`, so a
+            tight deadline degrades into an honest partial answer rather than
+            an error — which is the point of setting one.
+
+            CLAMPED to the node's configured timeout: a caller may ask for
+            LESS time, never more. An unbounded deadline from a stranger would
+            pin a node's query slots open for as long as they liked.
+
+    Query:
+      type: object
+      description: |
+        Query DSL. Exactly one top-level key specifying the query type.
+        ES-inspired shape for familiarity, but all behavior is explicit.
+      properties:
+        match:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  query:
+                    type: string
+                required: [query]
+          description: |
+            Full-text analyzed search. Requires FullTextSearchable
+            capability on the target field.
+        match_phrase:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  query:
+                    type: string
+                  slop:
+                    type: integer
+                    minimum: 0
+                    description: Positions between tokens allowed. Default 0 (exact phrase).
+                required: [query]
+          description: |
+            Phrase match — tokens must appear consecutively. Optional slop
+            allows intervening tokens. Requires FullTextSearchable capability.
+        term:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  value:
+                    type: string
+                required: [value]
+          description: |
+            Exact-match term lookup. Requires ExactMatchable capability.
+        range:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RangeBounds"
+          description: |
+            Range query on numeric, date, or keyword fields. Requires
+            RangeQueryable capability. Date bounds accept ISO-8601 strings
+            (nanosecond precision), epoch milliseconds, or date math
+            expressions (e.g. "now-7d").
+        bool:
+          $ref: "#/components/schemas/BoolQuery"
+        match_all:
+          type: object
+          description: Match all documents. No field requirement.
+        multi_match:
+          type: object
+          properties:
+            query:
+              type: string
+              description: The text to search for across all listed fields.
+            fields:
+              type: array
+              items:
+                type: string
+              description: Fields to search. At least one required.
+          required: [query, fields]
+          description: |
+            Multi-field full-text search. Desugars to a bool/should over
+            per-field match queries. Requires FullTextSearchable capability
+            on each listed field.
+        geo_distance:
+          $ref: "#/components/schemas/GeoDistanceQuery"
+        geo_shape:
+          $ref: "#/components/schemas/ShapeQuery"
+        shape:
+          $ref: "#/components/schemas/ShapeQuery"
+        xy_shape:
+          $ref: "#/components/schemas/ShapeQuery"
+        knn:
+          $ref: "#/components/schemas/KnnQuery"
+        late_interaction:
+          $ref: "#/components/schemas/LateInteractionQuery"
+        hybrid:
+          $ref: "#/components/schemas/HybridQuery"
+        prefix:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  value:
+                    type: string
+                required: [value]
+          description: |
+            Prefix query — matches terms starting with the given value.
+            Supports both text and keyword fields. Not analyzed.
+        fuzzy:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              value:
+                type: string
+                description: The term to search for (will be analyzed).
+              fuzziness:
+                description: 'Edit distance. "AUTO", 0, 1, or 2. Default "AUTO".'
+                oneOf:
+                  - type: string
+                    enum: [AUTO]
+                  - type: integer
+                    minimum: 0
+                    maximum: 2
+              prefix_length:
+                type: integer
+                minimum: 0
+                description: Leading characters that must match exactly. Default 0.
+              transpositions:
+                type: boolean
+                description: Count transpositions as single edit. Default true.
+            required: [value]
+          description: |
+            Fuzzy term query with Levenshtein edit distance. Requires
+            FullTextSearchable capability. "AUTO" fuzziness maps to
+            distance 0 for terms <=2 chars, 1 for 3-5, 2 for >=6.
+        wildcard:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  value:
+                    type: string
+                required: [value]
+          description: |
+            Wildcard pattern match with `*` (any run) and `?` (one character).
+            Not analyzed.
+        exists:
+          type: object
+          required: [field]
+          properties:
+            field:
+              type: string
+          description: Matches documents where the field has at least one value.
+        mmr:
+          $ref: "#/components/schemas/MmrQuery"
+        graph_traversal:
+          $ref: "#/components/schemas/GraphTraversalQuery"
+        information_content:
+          $ref: "#/components/schemas/InformationContentQuery"
+        concept_similarity:
+          $ref: "#/components/schemas/ConceptSimilarityQuery"
+
+    RangeBounds:
+      type: object
+      description: |
+        Range bounds for filtering. Supports string, integer, and float values.
+        Exclusive (gt/lt) and inclusive (gte/lte) bounds may not be combined
+        on the same side (e.g. gt + gte is invalid). Numeric bounds are
+        coerced to the field's storage type (e.g. float on an integer field
+        uses ceil for lower / floor for upper).
+      properties:
+        gt:
+          description: Exclusive lower bound (greater than)
+        gte:
+          description: Inclusive lower bound (greater than or equal)
+        lt:
+          description: Exclusive upper bound (less than)
+        lte:
+          description: Inclusive upper bound (less than or equal)
+
+    BoolQuery:
+      type: object
+      properties:
+        must:
+          type: array
+          items:
+            $ref: "#/components/schemas/Query"
+        should:
+          type: array
+          items:
+            $ref: "#/components/schemas/Query"
+        must_not:
+          type: array
+          items:
+            $ref: "#/components/schemas/Query"
+        filter:
+          type: array
+          items:
+            $ref: "#/components/schemas/Query"
+          description: Non-scoring filter clauses
+
+    GeoDistanceQuery:
+      type: object
+      description: |
+        Radius query around a point on a `geo_point` field. The centre and
+        radius are flat fields — there is no nested `location` object and the
+        radius is metres, not a unit-suffixed string.
+      required: [field, lat, lon, radius_meters]
+      properties:
+        field:
+          type: string
+        lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+        radius_meters:
+          type: number
+          format: double
+          exclusiveMinimum: 0
+          description: Search radius in METRES.
+
+    ShapeQuery:
+      type: object
+      description: |
+        Spatial-relation query over a `geo_shape`, cartesian `shape` or
+        cartesian `point` field. Accepted under `geo_shape`, `shape` or
+        `xy_shape` — the three keys are aliases and the relation applies to
+        whatever spatial field is named.
+      required: [field, geometry]
+      properties:
+        field:
+          type: string
+        geometry:
+          type: object
+          additionalProperties: true
+          description: GeoJSON geometry — the same format ingest accepts.
+        relation:
+          type: string
+          enum: [intersects, within, contains, disjoint]
+          default: intersects
+
+    MmrQuery:
+      type: object
+      description: |
+        Maximal Marginal Relevance diversity rerank over an inner query,
+        using a `dense_vector` field for the diversity similarity.
+      required: [query, field]
+      properties:
+        query:
+          $ref: "#/components/schemas/Query"
+        field:
+          type: string
+          description: The `dense_vector` field supplying the diversity similarity.
+        lambda:
+          type: number
+          format: float
+          default: 0.5
+          description: 1.0 = pure relevance, 0.0 = pure diversity. Clamped at execution.
+        candidates:
+          type: integer
+          minimum: 1
+          default: 100
+          description: How many inner results to consider before reranking.
+
+    GraphTraversalQuery:
+      type: object
+      description: Reachability over a `graph_edge` field.
+      required: [field, source]
+      properties:
+        field:
+          type: string
+        source:
+          type: integer
+          description: Source node id.
+        hops:
+          type: integer
+          minimum: 1
+        max_nodes:
+          type: integer
+          minimum: 1
+        graph_index:
+          type: string
+          description: Cross-index join — traverse this index instead of the searched one.
+        node_field:
+          type: string
+          description: Cross-index join — the filter field on the searched index.
+
+    InformationContentQuery:
+      type: object
+      description: "Information content of a taxonomy node (requires `taxonomy: true`)."
+      required: [field, source]
+      properties:
+        field:
+          type: string
+        source:
+          type: integer
+
+    ConceptSimilarityQuery:
+      type: object
+      description: "Similarity between two taxonomy nodes (requires `taxonomy: true`)."
+      required: [field, source, target]
+      properties:
+        field:
+          type: string
+        source:
+          type: integer
+        target:
+          type: integer
+        metric:
+          type: string
+
+    KnnQuery:
+      type: object
+      description: |
+        Approximate nearest-neighbour search over a `dense_vector` field.
+      required: [field, vector, k]
+      properties:
+        field:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+            format: double
+        k:
+          type: integer
+          minimum: 1
+        ef:
+          type: integer
+          minimum: 1
+          description: |
+            Search-list size (Vamana `L`) — the candidate pool the graph walk
+            keeps, i.e. where the query sits on the recall/latency curve. The
+            same dial as OpenSearch `ef_search` / Elasticsearch
+            `num_candidates`, and both of those names are accepted as aliases.
+            Omitted means the engine's own heuristic. Clamped up to `k`.
+        oversample:
+          type: number
+          format: double
+          minimum: 1
+          description: |
+            Rescore oversample factor for binary-quantized vector fields
+            (e.g. 3.0). Ignored for unquantized fields.
+
+    LateInteractionQuery:
+      type: object
+      description: |
+        Late-interaction (ColBERT / MaxSim) retrieval over a multi_vector field.
+        The query is itself a set of token vectors: each query token is scored
+        against its best-matching document token and the maxima are summed, so a
+        document that covers several query tokens across different vectors
+        outranks one that matches a single token well. Executed inside the
+        segment — only (document, score) leaves the shard.
+      required: [field, tokens, k]
+      properties:
+        field:
+          type: string
+          description: A multi_vector field.
+        tokens:
+          type: array
+          description: |
+            Query token vectors, one inner array per token. Every token must be
+            the field's declared `dimensions` wide; a ragged set is rejected
+            rather than reinterpreted.
+          minItems: 1
+          items:
+            type: array
+            minItems: 1
+            items:
+              type: number
+              format: double
+        k:
+          type: integer
+          minimum: 1
+        candidates_per_token:
+          type: integer
+          minimum: 1
+          description: |
+            Candidates pulled from the token graph per query token before the
+            MaxSim rerank. Raising it trades latency for recall — the dial `ef`
+            turns for single-vector kNN. Engine default when omitted.
+        ef:
+          type: integer
+          minimum: 1
+          description: Search-list size (Vamana L) for the per-token graph walk.
+
+    HybridQuery:
+      type: object
+      description: |
+        Multi-modal hybrid search with score normalization and combination.
+        Each sub-query is executed independently; the coordinator normalizes
+        and combines scores. Explicit sort is not supported — results are
+        always ranked by combined score.
+      required: [queries]
+      properties:
+        queries:
+          type: array
+          items:
+            $ref: "#/components/schemas/Query"
+          minItems: 1
+          description: Sub-queries to execute. Each can be any query type except hybrid (no nesting).
+        weights:
+          type: array
+          items:
+            type: number
+            format: double
+            minimum: 0
+          description: Per-sub-query weights (length must match queries). Default 1.0 each.
+        score_normalization:
+          type: object
+          properties:
+            technique:
+              type: string
+              enum: [min_max, z_score, l2, rrf]
+              default: min_max
+              description: Normalization technique to make heterogeneous scores comparable.
+            rank_constant:
+              type: integer
+              minimum: 1
+              description: Rank constant for RRF normalization. Default 60.
+        score_combination:
+          type: object
+          properties:
+            technique:
+              type: string
+              enum: [arithmetic_mean, harmonic_mean, geometric_mean, rrf]
+              default: arithmetic_mean
+              description: Combination technique to merge normalized scores.
+            rank_constant:
+              type: integer
+              minimum: 1
+              description: Rank constant for RRF combination. Default 60.
+
+    Rerank:
+      type: object
+      description: |
+        Post-fusion decay re-ranking. Adjusts scores based on a stored field's
+        distance from an origin point. Commonly used for recency decay.
+      required: [decay]
+      properties:
+        decay:
+          type: object
+          required: [field, scale]
+          properties:
+            field:
+              type: string
+              description: Stored field name (e.g. "timestamp", "updated_at")
+            origin:
+              description: |
+                Reference point. For dates: ISO 8601, epoch millis, or "now" (default).
+            scale:
+              type: string
+              description: Distance at which score equals `decay`. E.g. "7d", "12h", "30m".
+            decay:
+              type: number
+              format: double
+              minimum: 0
+              exclusiveMaximum: 1
+              default: 0.5
+              description: Score multiplier at `scale` distance.
+            offset:
+              type: string
+              default: "0"
+              description: Documents within this distance are not decayed. E.g. "1d".
+            function:
+              type: string
+              enum: [gaussian, exponential, linear]
+              default: exponential
+              description: Shape of the decay curve.
+
+    Collapse:
+      type: object
+      description: |
+        Collapse (deduplicate) results by a stored field value. Keeps the
+        top-scoring document per unique field value. Each surviving hit
+        includes `_collapse_count` showing how many duplicates were removed.
+      required: [field]
+      properties:
+        field:
+          type: string
+          description: Stored field name to group by (e.g. "domain", "category")
+
+    SortClause:
+      oneOf:
+        - type: string
+          description: |
+            Simple sort: "_score" for relevance, or a field name
+            (defaults to ascending).
+        - type: object
+          required: ["_geo_distance"]
+          properties:
+            _geo_distance:
+              type: object
+              required: [field, lat, lon]
+              properties:
+                field:
+                  type: string
+                lat:
+                  type: number
+                  format: double
+                lon:
+                  type: number
+                  format: double
+                order:
+                  type: string
+                  enum: [asc, desc]
+                  default: asc
+          description: |
+            Geo-distance sort. Note the FLAT body — `field`/`lat`/`lon`, not a
+            nested point object.
+
+
+            Engine support is not universal: the tantivy engine refuses this
+            with `400 unsupported_engine`. Where it IS served, ordering is
+            done by the serving engine and cannot be re-ordered by the
+            coordinator, so on an index with more than one claim the result is
+            each claim's nearest documents rather than the corpus's.
+        - type: object
+          additionalProperties:
+            type: object
+            properties:
+              order:
+                type: string
+                enum: [asc, desc]
+          description: |
+            Field sort with explicit order. The field must have the
+            Sortable capability.
+
+    # --- Search response ---
+
+    SearchResponse:
+      type: object
+      required: [hits, took, partial, coverage]
+      properties:
+        hits:
+          $ref: "#/components/schemas/HitsContainer"
+        took:
+          type: integer
+          description: Query execution time in milliseconds
+        partial:
+          type: boolean
+          description: |
+            True if the result set may be incomplete due to node
+            failures or timeouts. Clients that require complete retrieval
+            must reject partial responses.
+        coverage:
+          $ref: "#/components/schemas/SearchCoverage"
+        profile:
+          $ref: "#/components/schemas/SearchProfile"
+
+    SearchProfile:
+      type: object
+      description: |
+        Query execution profile. Present only when the request set
+        `profile: true`.
+      required: [graph]
+      properties:
+        graph:
+          type: object
+          required:
+            - plan
+            - reachability_ms
+            - materialize_ms
+            - segment_edges
+            - estimated_hits
+          properties:
+            plan:
+              type: string
+            reachability_ms:
+              type: integer
+            materialize_ms:
+              type: integer
+            segment_edges:
+              type: integer
+            estimated_hits:
+              type: integer
+
+    SearchCoverage:
+      type: object
+      required: [expected_claims, served_claims, skipped_claims]
+      description: Auditable claim-level completeness for this search.
+      properties:
+        expected_claims:
+          type: integer
+          minimum: 0
+          description: Claims the index resolves to.
+        served_claims:
+          type: integer
+          minimum: 0
+          description: Claims that served this query.
+        skipped_claims:
+          type: array
+          description: Claims omitted from the result and the reason each was skipped.
+          items:
+            $ref: "#/components/schemas/SkippedClaim"
+
+    SkippedClaim:
+      type: object
+      required: [claim_id, reason]
+      properties:
+        claim_id:
+          type: integer
+          minimum: 0
+        reason:
+          type: string
+
+    HitsContainer:
+      type: object
+      required: [total, hits]
+      properties:
+        total:
+          $ref: "#/components/schemas/TotalHits"
+        hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hit"
+
+    TotalHits:
+      type: object
+      description: |
+        Hit-count summary. Always present — read `relation` before reading
+        `value`, because the default is a LOWER BOUND, not a count.
+      required: [value, relation]
+      properties:
+        value:
+          type: integer
+        relation:
+          type: string
+          enum: [eq, gte]
+          description: |
+            `eq` means `value` is the exact number of matching documents.
+            `gte` means it is a LOWER BOUND — currently the case whenever the
+            engine did not count the corpus, which is the default. Treat a
+            `gte` total as "at least this many", never as a result count.
+
+    Hit:
+      type: object
+      required: [_id]
+      properties:
+        _id:
+          type: string
+        _score:
+          type:
+            - number
+            - "null"
+          format: float
+          description: Relevance score. Null when sorting by field.
+        _source:
+          type: object
+          additionalProperties: true
+          description: |
+            Stored document fields. Present only if _source is
+            requested (default: true).
+        _version:
+          type: string
+          description: |
+            HLC document version, as the canonical wire string
+            `wall_ms.counter.node_id_hex`. Omitted when no version is stored.
+        sort:
+          type: array
+          items: {}
+          description: |
+            This hit's sort values — the cursor to pass back as
+            `search_after`. Present only when the request asked for an
+            explicit `sort`; array order matches the request's `sort`, with
+            `_id` appended as the tiebreaker.
+        _per_leg_scores:
+          type: array
+          items:
+            type: number
+            format: float
+          description: |
+            Per-leg normalized scores from hybrid search. Index matches
+            sub-query order. Missing legs show 0.0. Only present for
+            hybrid queries.
+        _collapse_count:
+          type: integer
+          minimum: 0
+          description: |
+            Number of deduplicated documents sharing the same collapse
+            field value. Only present when collapse is active.
