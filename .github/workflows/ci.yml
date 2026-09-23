@@ -24,30 +24,92 @@ jobs:
           fi
       - run: go test ./... -race
 
+  can-reach-a-node:
+    # `lucenia/lucenia` is an INTERNAL repository, so this workflow's own
+    # GITHUB_TOKEN cannot read its releases — an unauthenticated fetch gets a
+    # 404, not a 401, which made the first failure look like a missing asset.
+    # Downloading a node needs a token with read access to that repo, stored
+    # here as LUCENIA_RELEASE_TOKEN.
+    #
+    # A secret cannot be read from a job-level `if`, so the check is its own
+    # job and the answer becomes an output. The secret's VALUE is never echoed.
+    name: node available?
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - id: check
+        env:
+          TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+        run: |
+          if [ -n "${TOKEN:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
   conformance:
     # The layer that matters. Compiling proves the types match the
     # description; only this proves the description matches the server.
     name: conformance against a real node
     runs-on: ubuntu-latest
+    needs: can-reach-a-node
+    if: needs.can-reach-a-node.outputs.available == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.23" }
 
       - name: Fetch a node
+        env:
+          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
-          tag=$(curl -fsSL https://api.github.com/repos/lucenia/lucenia/releases/latest \
-                | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          tag=$(gh release view --repo lucenia/lucenia --json tagName -q .tagName)
           echo "using $tag"
-          curl -fsSL -o node.tar.gz \
-            "https://github.com/lucenia/lucenia/releases/download/$tag/lucenia-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "$tag" --repo lucenia/lucenia \
+            --pattern 'lucenia-x86_64-unknown-linux-gnu.tar.gz' --output node.tar.gz
           tar xzf node.tar.gz
           # A node runs JVM-free on the native engine, so no Java is needed.
           echo "GNARL_BINARY=$PWD/lucenia" >> "$GITHUB_ENV"
 
       - name: Conformance
         run: go test ./conformance/... -v
+
+  conformance-status:
+    # A skipped job shows as a grey tick, and a row of ticks where one of them
+    # means "did not run" is how a suite stops being read. This always runs and
+    # says, in the summary, whether the layer that matters actually ran.
+    name: conformance ran?
+    runs-on: ubuntu-latest
+    needs: [can-reach-a-node, conformance]
+    if: always()
+    steps:
+      - name: Report
+        run: |
+          if [ "${{ needs.can-reach-a-node.outputs.available }}" != "true" ]; then
+            {
+              echo "### Conformance did NOT run"
+              echo
+              echo "No \`LUCENIA_RELEASE_TOKEN\` secret, so no node could be"
+              echo "downloaded — \`lucenia/lucenia\` is internal and this"
+              echo "workflow's own token cannot read it."
+              echo
+              echo "Everything green above is unit, regression and"
+              echo "spec-drift. **None of it talked to a server.**"
+              echo
+              echo "Set the secret from a real terminal (\`gh secret set\`"
+              echo "through a non-interactive shell stores an EMPTY value and"
+              echo "still exits 0) with a token that can read that repo's"
+              echo "releases."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${{ needs.conformance.result }}" != "success" ]; then
+            echo "conformance: ${{ needs.conformance.result }}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "### Conformance ran against a real node" >> "$GITHUB_STEP_SUMMARY"
 
   spec-drift:
     # The generated layer must match the description it claims to come from.
