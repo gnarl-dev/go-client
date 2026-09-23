@@ -27,7 +27,12 @@ import (
 // that do not exist: docs drift toward what USED to be true, and only a
 // machine reading them notices.
 
-var goFence = regexp.MustCompile("(?s)```go\\n(.*?)```")
+// A fence, optionally preceded by a skip directive that must state a reason.
+// Same idiom as the Python client's doc tests. An exemption without a reason is
+// how a suite quietly stops covering anything, so the reason is required and
+// its absence is a test failure rather than a silent skip.
+var goFence = regexp.MustCompile(
+	"(?s)(?:<!--\\s*doctest:\\s*skip([^>]*?)-->\\s*\\n)?```go\\n(.*?)```")
 
 // readmeBlocks returns each Go fence with the README line it starts on.
 func readmeBlocks(t *testing.T) []struct {
@@ -46,7 +51,15 @@ func readmeBlocks(t *testing.T) []struct {
 		Code string
 	}
 	for _, m := range goFence.FindAllStringSubmatchIndex(text, -1) {
-		code := text[m[2]:m[3]]
+		if m[2] >= 0 {
+			reason := strings.TrimSpace(text[m[2]:m[3]])
+			if !strings.HasPrefix(reason, "because ") {
+				t.Errorf("README.md: a doctest skip must say why: "+
+					"`<!-- doctest: skip because ... -->`, got %q", reason)
+			}
+			continue
+		}
+		code := text[m[4]:m[5]]
 		line := strings.Count(text[:m[0]], "\n") + 1
 		out = append(out, struct {
 			Line int
@@ -83,9 +96,9 @@ func TestReadmeGoExamplesCompile(t *testing.T) {
 
 go 1.23
 
-require github.com/lucenia/gnarl-go v0.0.0
+require github.com/gnarl-dev/go-client v0.0.0
 
-replace github.com/lucenia/gnarl-go => %s
+replace github.com/gnarl-dev/go-client => %s
 `, i, modDir))
 
 			// Reuse the parent module's resolved dependencies rather than
@@ -126,7 +139,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/lucenia/gnarl-go"
+	gnarl "github.com/gnarl-dev/go-client"
 )
 
 // Referenced by snippets so the wrapper does not have to guess which of

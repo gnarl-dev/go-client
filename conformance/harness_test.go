@@ -33,7 +33,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lucenia/gnarl-go"
+	gnarl "github.com/gnarl-dev/go-client"
 )
 
 // client is the shared client for the package, set up by TestMain.

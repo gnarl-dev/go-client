@@ -1,4 +1,4 @@
-# gnarl-go
+# go-client
 
 The Go client for [Gnarl](https://gnarl.dev) — a decentralized search fabric.
 
@@ -6,7 +6,15 @@ A node is a peer, not a coordinator, so there is no cluster endpoint to point
 at. You talk to a node and it answers for the mesh. Any node will do.
 
 ```bash
-go get github.com/lucenia/gnarl-go
+go get github.com/gnarl-dev/go-client
+```
+
+The package is named `gnarl`; the repository is `go-client`. Import it with an
+explicit alias, which is what `goimports` writes anyway:
+
+<!-- doctest: skip because a bare import is not a compilable program -->
+```go
+import gnarl "github.com/gnarl-dev/go-client"
 ```
 
 ## Quick start
@@ -19,7 +27,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/lucenia/gnarl-go"
+    gnarl "github.com/gnarl-dev/go-client"
 )
 
 func main() {

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/lucenia/gnarl-go/internal/oas"
+	"github.com/gnarl-dev/go-client/internal/oas"
 )
 
 // Re-exported spec types, so callers never import an internal package.

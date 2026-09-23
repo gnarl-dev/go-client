@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lucenia/gnarl-go"
+	gnarl "github.com/gnarl-dev/go-client"
 )
 
 // searchable polls until the query returns at least want hits.

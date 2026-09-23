@@ -1,4 +1,4 @@
-module github.com/lucenia/gnarl-go
+module github.com/gnarl-dev/go-client
 
 go 1.24.0
 

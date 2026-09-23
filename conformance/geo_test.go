@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/lucenia/gnarl-go"
+	gnarl "github.com/gnarl-dev/go-client"
 )
 
 // Landmarks with real coordinates, so the distances asserted here mean

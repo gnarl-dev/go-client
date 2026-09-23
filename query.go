@@ -1,6 +1,6 @@
 package gnarl
 
-import "github.com/lucenia/gnarl-go/internal/oas"
+import "github.com/gnarl-dev/go-client/internal/oas"
 
 // Query builders.
 //
