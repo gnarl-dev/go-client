@@ -106,12 +106,17 @@ func startNode() (addr string, stop func(), skip string) {
 
 	// --single-node keeps this node off any real mesh: a conformance run must
 	// not discover a developer's cluster, join it, and then assert on data it
-	// does not own. --no-tls keeps the harness free of certificate handling.
+	// does not own.
+	//
+	// TLS is left ON, which is the product default: `lucenia start` serves https
+	// from a self-signed certificate and --no-tls is the opt-out. The harness
+	// used to pass --no-tls to avoid certificate handling, and that quietly made
+	// the suite test a configuration most readers never run — which is how the
+	// README shipped an http:// quick start that cannot reach a default node.
 	cmd := exec.Command(bin, "start",
 		"--port", fmt.Sprint(port),
 		"--data-dir", dir,
 		"--single-node",
-		"--no-tls",
 		"--headless",
 	)
 	cmd.Stdout = os.Stderr
@@ -129,7 +134,7 @@ func startNode() (addr string, stop func(), skip string) {
 		os.RemoveAll(dir)
 	}
 
-	addr = fmt.Sprintf("http://127.0.0.1:%d", port)
+	addr = fmt.Sprintf("https://127.0.0.1:%d", port)
 	if err := waitReady(addr, 60*time.Second); err != nil {
 		stop()
 		return "", nil, fmt.Sprintf("node at %s never became ready: %v", addr, err)
@@ -142,7 +147,8 @@ func startNode() (addr string, stop func(), skip string) {
 // laptop and fails on a loaded CI runner, and the failure looks like a product
 // defect rather than a slow start.
 func waitReady(addr string, within time.Duration) error {
-	c, err := gnarl.New(addr, gnarl.WithTimeout(2*time.Second))
+	c, err := gnarl.New(addr, gnarl.WithTimeout(2*time.Second),
+		gnarl.WithInsecureSkipVerify())
 	if err != nil {
 		return err
 	}

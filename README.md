@@ -23,7 +23,7 @@ import (
 )
 
 func main() {
-    c, err := gnarl.New("http://localhost:8080")
+    c, err := gnarl.New("https://localhost:8080", gnarl.WithInsecureSkipVerify())
     if err != nil {
         log.Fatal(err)
     }
@@ -151,9 +151,16 @@ if err != nil {
 _ = authed
 ```
 
-A node generates a self-signed certificate on first run. Against a node you
-started yourself, `gnarl.WithInsecureSkipVerify()` skips verification — never
-against one you did not.
+**A node serves TLS by default.** `lucenia start` listens on **8080** over
+**https** with a self-signed certificate it generates on first run; `--no-tls`
+turns that off, and the desktop build uses it, but a node started with the plain
+command speaks https — which is why the quick start above says so.
+
+That certificate cannot be verified, because nothing signed it.
+`gnarl.WithInsecureSkipVerify()` is right for a node **you started yourself**
+and wrong for anything else: it turns off the protection TLS exists to provide,
+and a client that keeps it on by habit will talk to whoever answers the address.
+Against a node with a real certificate, pass neither.
 
 ## How this package is built
 
@@ -183,7 +190,7 @@ the conformance suite starts a real node and drives it:
 ```bash
 go test ./...                              # unit only; conformance skips
 GNARL_BINARY=/path/to/lucenia go test ./...  # starts a node, runs everything
-GNARL_TEST_NODE=http://localhost:8080 go test ./...  # uses a node you have
+GNARL_TEST_NODE=https://localhost:8080 go test ./... # uses a node you have
 ```
 
 Writing this client found four defects in the API description on its first
