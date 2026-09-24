@@ -33,6 +33,30 @@ func (e BulkIndexResponseAck) Valid() bool {
 	}
 }
 
+// Defines values for ClaimRouteVerification.
+const (
+	ClaimRouteVerificationFailed     ClaimRouteVerification = "failed"
+	ClaimRouteVerificationLocal      ClaimRouteVerification = "local"
+	ClaimRouteVerificationUnverified ClaimRouteVerification = "unverified"
+	ClaimRouteVerificationVerified   ClaimRouteVerification = "verified"
+)
+
+// Valid indicates whether the value is a known member of the ClaimRouteVerification enum.
+func (e ClaimRouteVerification) Valid() bool {
+	switch e {
+	case ClaimRouteVerificationFailed:
+		return true
+	case ClaimRouteVerificationLocal:
+		return true
+	case ClaimRouteVerificationUnverified:
+		return true
+	case ClaimRouteVerificationVerified:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ErrorBodyType.
 const (
 	ErrorBodyTypeDocumentNotFound          ErrorBodyType = "document_not_found"
@@ -428,19 +452,19 @@ func (e SnapshotJobKind) Valid() bool {
 
 // Defines values for SnapshotJobState.
 const (
-	Failed    SnapshotJobState = "failed"
-	Running   SnapshotJobState = "running"
-	Succeeded SnapshotJobState = "succeeded"
+	SnapshotJobStateFailed    SnapshotJobState = "failed"
+	SnapshotJobStateRunning   SnapshotJobState = "running"
+	SnapshotJobStateSucceeded SnapshotJobState = "succeeded"
 )
 
 // Valid indicates whether the value is a known member of the SnapshotJobState enum.
 func (e SnapshotJobState) Valid() bool {
 	switch e {
-	case Failed:
+	case SnapshotJobStateFailed:
 		return true
-	case Running:
+	case SnapshotJobStateRunning:
 		return true
-	case Succeeded:
+	case SnapshotJobStateSucceeded:
 		return true
 	default:
 		return false
@@ -720,6 +744,34 @@ type BulkStreamResponse struct {
 	Took int `json:"took"`
 }
 
+// ClaimRoute One claim's journey — who served it, how, and why not.
+type ClaimRoute struct {
+	ClaimId int32 `json:"claim_id"`
+
+	// Reason Why the claim was skipped — `timeout`, `unreachable`, and so on.
+	// Absent when it was served.
+	Reason *string `json:"reason,omitempty"`
+
+	// ServedBy Hex node id of the peer that served this claim. Absent when
+	// nobody did.
+	ServedBy *string `json:"served_by,omitempty"`
+
+	// Source How the claim was answered — for example `local_primary`,
+	// `remote_replica` or `skipped`. Free-form: new sources may appear,
+	// so match the ones you care about and pass the rest through.
+	Source string `json:"source"`
+
+	// Verification This claim's verification state. `unverified` means could not
+	// check, which is NOT `failed`; conflating them either invents
+	// trust or discards good data.
+	Verification ClaimRouteVerification `json:"verification"`
+}
+
+// ClaimRouteVerification This claim's verification state. `unverified` means could not
+// check, which is NOT `failed`; conflating them either invents
+// trust or discards good data.
+type ClaimRouteVerification string
+
 // Collapse Collapse (deduplicate) results by a stored field value. Keeps the
 // top-scoring document per unique field value. Each surviving hit
 // includes `_collapse_count` showing how many duplicates were removed.
@@ -796,6 +848,53 @@ type ErrorResponse struct {
 	// not part of the forward contract and will be removed in a future
 	// major version.
 	Error ErrorBody `json:"error"`
+}
+
+// FanOutProfile Where the query actually went, and what came back.
+//
+// A distributed search that cannot tell you which peers answered is
+// asking to be trusted rather than audited. The node already knows all
+// of this while answering; setting `profile: true` is what stops it
+// being discarded at the HTTP boundary.
+//
+// The four verification counts partition `claims` exactly:
+// `verified + unverified + failed_verification + local` equals its
+// length. `unverified` is its own count on purpose — a claim nobody
+// could check is not a claim that passed.
+type FanOutProfile struct {
+	// Claims One row per claim the query addressed.
+	Claims []ClaimRoute `json:"claims"`
+
+	// DeadlineMs The per-shard deadline this query actually ran under, after the
+	// node clamped `scope.deadline_ms` to its own budget.
+	DeadlineMs int64 `json:"deadline_ms"`
+
+	// FailedVerificationClaims Claims whose proof did NOT check out. Their documents were not
+	// served.
+	FailedVerificationClaims int32 `json:"failed_verification_claims"`
+
+	// LocalClaims Claims this node served itself. There is no remote party to
+	// attest to, so there is nothing to verify — counted separately so
+	// the four states account for every claim and a reader can see
+	// that they do.
+	LocalClaims int32 `json:"local_claims"`
+
+	// NodesContacted Distinct nodes this query was sent to.
+	NodesContacted int32 `json:"nodes_contacted"`
+
+	// NodesResponded Distinct nodes that answered. Fewer than contacted means a peer
+	// went silent — the case `partial` summarises and this attributes.
+	NodesResponded int32 `json:"nodes_responded"`
+
+	// UnverifiedClaims Claims this node could not check — no proof arrived, or there is
+	// no authenticated index for them. Reported separately from
+	// verified because a silent pass that reads as a real check is the
+	// failure this whole path exists to avoid.
+	UnverifiedClaims int32 `json:"unverified_claims"`
+
+	// VerifiedClaims Claims whose documents were PROVEN authentic against an anchor
+	// this node holds independently of the responder.
+	VerifiedClaims int32 `json:"verified_claims"`
 }
 
 // FieldDefinition Field options configure how a capability is implemented, not
@@ -1460,15 +1559,34 @@ type SearchCoverage struct {
 }
 
 // SearchProfile Query execution profile. Present only when the request set
-// `profile: true`.
+// `profile: true`, and only when there was something to report.
+//
+// Both members are OPTIONAL and each appears when it applies. `graph`
+// is emitted only for a graph traversal, so the ordinary case — any
+// other query with `profile: true` — carries `fan_out` alone. A client
+// that treats `graph` as guaranteed rejects the common response.
 type SearchProfile struct {
-	Graph struct {
-		EstimatedHits  int    `json:"estimated_hits"`
-		MaterializeMs  int    `json:"materialize_ms"`
+	// FanOut Where the query actually went, and what came back.
+	//
+	// A distributed search that cannot tell you which peers answered is
+	// asking to be trusted rather than audited. The node already knows all
+	// of this while answering; setting `profile: true` is what stops it
+	// being discarded at the HTTP boundary.
+	//
+	// The four verification counts partition `claims` exactly:
+	// `verified + unverified + failed_verification + local` equals its
+	// length. `unverified` is its own count on purpose — a claim nobody
+	// could check is not a claim that passed.
+	FanOut *FanOutProfile `json:"fan_out,omitempty"`
+
+	// Graph Graph-traversal phase timing. Present only for a graph query.
+	Graph *struct {
+		EstimatedHits  int32  `json:"estimated_hits"`
+		MaterializeMs  int64  `json:"materialize_ms"`
 		Plan           string `json:"plan"`
-		ReachabilityMs int    `json:"reachability_ms"`
-		SegmentEdges   int    `json:"segment_edges"`
-	} `json:"graph"`
+		ReachabilityMs int64  `json:"reachability_ms"`
+		SegmentEdges   int32  `json:"segment_edges"`
+	} `json:"graph,omitempty"`
 }
 
 // SearchRequest defines model for SearchRequest.
@@ -1487,10 +1605,14 @@ type SearchRequest struct {
 	// rows. Use `search_after` to walk a large result set.
 	From *int `json:"from,omitempty"`
 
-	// Profile Include a `profile` block in the response with graph-traversal
-	// phase timing (reachability vs materialize), and the fan-out:
-	// which peer served each claim, which were skipped and why, and
-	// how many nodes answered.
+	// Profile Include a `profile` block in the response: the fan-out — which
+	// peer served each claim, which were skipped and why, how many
+	// nodes answered and what each claim's proof came to — and, for a
+	// graph traversal, phase timing (reachability vs materialize).
+	//
+	// Each member of `profile` appears only when it applies, so the
+	// usual response carries `fan_out` without `graph`. The node
+	// computes none of this unless you ask.
 	Profile *bool `json:"profile,omitempty"`
 
 	// Query Query DSL. Exactly one top-level key specifying the query type.
@@ -1584,7 +1706,12 @@ type SearchResponse struct {
 	Partial bool `json:"partial"`
 
 	// Profile Query execution profile. Present only when the request set
-	// `profile: true`.
+	// `profile: true`, and only when there was something to report.
+	//
+	// Both members are OPTIONAL and each appears when it applies. `graph`
+	// is emitted only for a graph traversal, so the ordinary case — any
+	// other query with `profile: true` — carries `fan_out` alone. A client
+	// that treats `graph` as guaranteed rejects the common response.
 	Profile *SearchProfile `json:"profile,omitempty"`
 
 	// Took Query execution time in milliseconds

@@ -285,9 +285,27 @@ paths:
       operationId: deleteDocument
       tags: [documents]
       summary: Delete a document by ID
+      description: |
+        Remove one document.
+
+        **A delete is acknowledged when it is DURABLE, not when it has become
+        invisible.** The same asymmetry as a write, and easy to miss in this
+        direction: a `GET` or a `_search` issued immediately after this returns
+        200 can still see the document, until the next commit lands.
+
+        `_doc` and `_search` cross that boundary TOGETHER — there is no window
+        where one shows the document and the other does not — so a reader is
+        never caught between two answers.
+
+        Do not read a still-readable document as a failed delete, and do not
+        assert absence without waiting for it. If "gone" has to be observable,
+        poll until the read reports `document_not_found`. The wait is short,
+        but it is not zero, and it is not a fixed number worth hard-coding.
       responses:
         "200":
-          description: Document deleted
+          description: |
+            Delete accepted and durable. The document may remain readable for
+            a short interval — see the description above.
         "404":
           description: Document or index not found
           content:
@@ -573,6 +591,13 @@ paths:
       operationId: deleteNamespaceDocument
       tags: [namespaces]
       summary: Delete a document from a namespace
+      description: |
+        Remove one document from a namespace.
+
+        As with `deleteDocument`, this is acknowledged when it is DURABLE, not
+        when it has become invisible: a read issued immediately afterwards can
+        still see the document until the next commit lands. Poll for
+        `document_not_found` rather than asserting absence straight away.
       responses:
         "200":
           description: Delete result
@@ -2631,10 +2656,14 @@ components:
         profile:
           type: boolean
           description: |
-            Include a `profile` block in the response with graph-traversal
-            phase timing (reachability vs materialize), and the fan-out:
-            which peer served each claim, which were skipped and why, and
-            how many nodes answered.
+            Include a `profile` block in the response: the fan-out — which
+            peer served each claim, which were skipped and why, how many
+            nodes answered and what each claim's proof came to — and, for a
+            graph traversal, phase timing (reachability vs materialize).
+
+            Each member of `profile` appears only when it applies, so the
+            usual response carries `fan_out` without `graph`. The node
+            computes none of this unless you ask.
         verify:
           type: boolean
           description: |
@@ -3233,11 +3262,17 @@ components:
       type: object
       description: |
         Query execution profile. Present only when the request set
-        `profile: true`.
-      required: [graph]
+        `profile: true`, and only when there was something to report.
+
+        Both members are OPTIONAL and each appears when it applies. `graph`
+        is emitted only for a graph traversal, so the ordinary case — any
+        other query with `profile: true` — carries `fan_out` alone. A client
+        that treats `graph` as guaranteed rejects the common response.
       properties:
         graph:
           type: object
+          description: |
+            Graph-traversal phase timing. Present only for a graph query.
           required:
             - plan
             - reachability_ms
@@ -3249,12 +3284,132 @@ components:
               type: string
             reachability_ms:
               type: integer
+              format: int64
             materialize_ms:
               type: integer
+              format: int64
             segment_edges:
               type: integer
+              format: int32
             estimated_hits:
               type: integer
+              format: int32
+        fan_out:
+          $ref: "#/components/schemas/FanOutProfile"
+
+    FanOutProfile:
+      type: object
+      description: |
+        Where the query actually went, and what came back.
+
+        A distributed search that cannot tell you which peers answered is
+        asking to be trusted rather than audited. The node already knows all
+        of this while answering; setting `profile: true` is what stops it
+        being discarded at the HTTP boundary.
+
+        The four verification counts partition `claims` exactly:
+        `verified + unverified + failed_verification + local` equals its
+        length. `unverified` is its own count on purpose — a claim nobody
+        could check is not a claim that passed.
+      required:
+        - nodes_contacted
+        - nodes_responded
+        - deadline_ms
+        - claims
+        - verified_claims
+        - unverified_claims
+        - failed_verification_claims
+        - local_claims
+      properties:
+        nodes_contacted:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Distinct nodes this query was sent to.
+        nodes_responded:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Distinct nodes that answered. Fewer than contacted means a peer
+            went silent — the case `partial` summarises and this attributes.
+        deadline_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The per-shard deadline this query actually ran under, after the
+            node clamped `scope.deadline_ms` to its own budget.
+        claims:
+          type: array
+          description: One row per claim the query addressed.
+          items:
+            $ref: "#/components/schemas/ClaimRoute"
+        verified_claims:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Claims whose documents were PROVEN authentic against an anchor
+            this node holds independently of the responder.
+        unverified_claims:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Claims this node could not check — no proof arrived, or there is
+            no authenticated index for them. Reported separately from
+            verified because a silent pass that reads as a real check is the
+            failure this whole path exists to avoid.
+        failed_verification_claims:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Claims whose proof did NOT check out. Their documents were not
+            served.
+        local_claims:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Claims this node served itself. There is no remote party to
+            attest to, so there is nothing to verify — counted separately so
+            the four states account for every claim and a reader can see
+            that they do.
+
+    ClaimRoute:
+      type: object
+      description: One claim's journey — who served it, how, and why not.
+      required: [claim_id, source, verification]
+      properties:
+        claim_id:
+          type: integer
+          format: int32
+          minimum: 0
+        served_by:
+          type: string
+          description: |
+            Hex node id of the peer that served this claim. Absent when
+            nobody did.
+        source:
+          type: string
+          description: |
+            How the claim was answered — for example `local_primary`,
+            `remote_replica` or `skipped`. Free-form: new sources may appear,
+            so match the ones you care about and pass the rest through.
+        verification:
+          type: string
+          enum: [verified, unverified, failed, local]
+          description: |
+            This claim's verification state. `unverified` means could not
+            check, which is NOT `failed`; conflating them either invents
+            trust or discards good data.
+        reason:
+          type: string
+          description: |
+            Why the claim was skipped — `timeout`, `unreachable`, and so on.
+            Absent when it was served.
 
     SearchCoverage:
       type: object
