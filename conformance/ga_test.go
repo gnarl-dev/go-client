@@ -151,7 +151,7 @@ type note struct {
 func TestNamespaceLifecycle(t *testing.T) {
 	c := need(t)
 	ns := c.Namespace(uniqueName(t, "ns"))
-	t.Cleanup(func() { _ = ns.Delete(ctx(t)) })
+	t.Cleanup(func() { _ = ns.Delete(cleanupCtx()) })
 
 	id, err := ns.IndexDocument(ctx(t), "n-1", note{Body: "kettle descaling"})
 	if err != nil {
@@ -231,7 +231,7 @@ func TestNamespacesAreIsolated(t *testing.T) {
 	c := need(t)
 	a := c.Namespace(uniqueName(t, "nsa"))
 	b := c.Namespace(uniqueName(t, "nsb"))
-	t.Cleanup(func() { _ = a.Delete(ctx(t)); _ = b.Delete(ctx(t)) })
+	t.Cleanup(func() { _ = a.Delete(cleanupCtx()); _ = b.Delete(cleanupCtx()) })
 
 	if _, err := a.IndexDocument(ctx(t), "x", note{Body: "secret plans"}); err != nil {
 		t.Fatalf("IndexDocument: %v", err)
@@ -260,7 +260,7 @@ func TestNamespacesAreIsolated(t *testing.T) {
 func TestNamespaceKeyLifecycle(t *testing.T) {
 	c := need(t)
 	ns := c.Namespace(uniqueName(t, "nsk"))
-	t.Cleanup(func() { _ = ns.Delete(ctx(t)) })
+	t.Cleanup(func() { _ = ns.Delete(cleanupCtx()) })
 	if _, err := ns.IndexDocument(ctx(t), "a", note{Body: "x"}); err != nil {
 		t.Fatalf("IndexDocument: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestNamespaceKeyLifecycle(t *testing.T) {
 func TestNamespacePromote(t *testing.T) {
 	c := need(t)
 	ns := c.Namespace(uniqueName(t, "nsp"))
-	t.Cleanup(func() { _ = ns.Delete(ctx(t)) })
+	t.Cleanup(func() { _ = ns.Delete(cleanupCtx()) })
 	if _, err := ns.IndexDocument(ctx(t), "a", note{Body: "promote me"}); err != nil {
 		t.Fatalf("IndexDocument: %v", err)
 	}
@@ -412,7 +412,9 @@ func TestMemoryIngest(t *testing.T) {
 	}
 
 	out, err = c.IngestDocument(ctx(t), gnarl.IngestDocumentRequest{
-		Filename: ns + ".txt", Content: []byte("the boiler service is due in november"),
+		// The trailing bytes encode to '+' and '/', the two characters that
+		// tell standard base64 from the URL alphabet a client might reach for.
+		Filename: ns + ".txt", Content: []byte("the boiler service is due in november \xfb\xff\xfe"),
 		Space: "personal",
 	})
 	memoryOr(t, err)
@@ -440,7 +442,7 @@ func fsRepository(t *testing.T, c *gnarl.Client) string {
 	if repo.Repository == nil || *repo.Repository != name {
 		t.Errorf("registered repository answered %+v", repo)
 	}
-	t.Cleanup(func() { _ = c.UnregisterRepository(ctx(t), name) })
+	t.Cleanup(func() { _ = c.UnregisterRepository(cleanupCtx(), name) })
 	return name
 }
 

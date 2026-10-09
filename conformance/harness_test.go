@@ -39,6 +39,9 @@ import (
 // client is the shared client for the package, set up by TestMain.
 var client *gnarl.Client
 
+// nodeAddr is the node's base URL, for the few tests that speak raw HTTP.
+var nodeAddr string
+
 // skipReason is non-empty when no node could be found. Tests skip with it
 // rather than failing: a developer without a node built should not see red.
 var skipReason string
@@ -46,6 +49,7 @@ var skipReason string
 func TestMain(m *testing.M) {
 	addr, stop, reason := startNode()
 	skipReason = reason
+	nodeAddr = addr
 	if reason == "" {
 		c, err := gnarl.New(addr, gnarl.WithInsecureSkipVerify())
 		if err != nil {
@@ -209,3 +213,7 @@ func ctx(t *testing.T) context.Context {
 	t.Cleanup(cancel)
 	return c
 }
+
+// cleanupCtx is the context for t.Cleanup, where ctx(t) cannot be used: it
+// registers a cleanup of its own. The client's own timeout bounds each call.
+func cleanupCtx() context.Context { return context.Background() }

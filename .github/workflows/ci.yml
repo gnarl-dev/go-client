@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly, against whatever node was released most recently. A client can
+  # break without a commit here: the node moves, and the only way to notice is
+  # to keep asking it.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
 
 jobs:
   unit:
@@ -25,92 +31,46 @@ jobs:
           fi
       - run: go test ./... -race
 
-  can-reach-a-node:
-    # `lucenia/lucenia` is an INTERNAL repository, so this workflow's own
-    # GITHUB_TOKEN cannot read its releases — an unauthenticated fetch gets a
-    # 404, not a 401, which made the first failure look like a missing asset.
-    # Downloading a node needs a token with read access to that repo, stored
-    # here as LUCENIA_RELEASE_TOKEN.
-    #
-    # A secret cannot be read from a job-level `if`, so the check is its own
-    # job and the answer becomes an output. The secret's VALUE is never echoed.
-    name: node available?
-    runs-on: ubuntu-latest
-    outputs:
-      available: ${{ steps.check.outputs.available }}
-    steps:
-      - id: check
-        env:
-          TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
-        run: |
-          if [ -n "${TOKEN:-}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
   conformance:
     # The layer that matters. Compiling proves the types match the
     # description; only this proves the description matches the server.
-    name: conformance against a real node
+    #
+    # The node comes from the PUBLIC gnarl-dev/releases, which this workflow's
+    # own token can read. This job used to download from lucenia/lucenia — an
+    # internal repository — behind a LUCENIA_RELEASE_TOKEN secret that was
+    # never set, so it skipped on every run since it was written and the
+    # suite that talks to a server had never once run in CI.
+    name: conformance against a released node
     runs-on: ubuntu-latest
-    needs: can-reach-a-node
-    if: needs.can-reach-a-node.outputs.available == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
 
-      - name: Fetch a node
+      - name: Fetch the latest released node
         env:
-          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=$(gh release view --repo lucenia/lucenia --json tagName -q .tagName)
+          tag=$(gh release view --repo gnarl-dev/releases --json tagName -q .tagName)
           echo "using $tag"
-          gh release download "$tag" --repo lucenia/lucenia \
-            --pattern 'lucenia-x86_64-unknown-linux-gnu.tar.gz' --output node.tar.gz
-          tar xzf node.tar.gz
-          # A node runs JVM-free on the native engine, so no Java is needed.
-          echo "GNARL_BINARY=$PWD/lucenia" >> "$GITHUB_ENV"
+          echo "### Conformance node: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p node && cd node
+          gh release download "$tag" --repo gnarl-dev/releases \
+            --pattern 'gnarl-x86_64-unknown-linux-gnu.tar.gz' \
+            --pattern 'SHA256SUMS.txt'
+          # Check the archive against the release's own checksums before
+          # running anything from it.
+          grep ' ./gnarl-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt \
+            | sed 's# \./# #' | sha256sum -c -
+          tar xzf gnarl-x86_64-unknown-linux-gnu.tar.gz
+          # The binary is `gnarl`; it runs JVM-free on the native engine, so
+          # no Java is needed. Its ONNX runtime libraries ship beside it.
+          echo "GNARL_BINARY=$PWD/gnarl" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD" >> "$GITHUB_ENV"
 
       - name: Conformance
-        run: go test ./conformance/... -v
-
-  conformance-status:
-    # A skipped job shows as a grey tick, and a row of ticks where one of them
-    # means "did not run" is how a suite stops being read. This always runs and
-    # says, in the summary, whether the layer that matters actually ran.
-    name: conformance ran?
-    runs-on: ubuntu-latest
-    needs: [can-reach-a-node, conformance]
-    if: always()
-    steps:
-      - name: Report
-        run: |
-          if [ "${{ needs.can-reach-a-node.outputs.available }}" != "true" ]; then
-            {
-              echo "### Conformance did NOT run"
-              echo
-              echo "No \`LUCENIA_RELEASE_TOKEN\` secret, so no node could be"
-              echo "downloaded — \`lucenia/lucenia\` is internal and this"
-              echo "workflow's own token cannot read it."
-              echo
-              echo "Everything green above is unit, regression and"
-              echo "spec-drift. **None of it talked to a server.**"
-              echo
-              echo "Set the secret from a real terminal (\`gh secret set\`"
-              echo "through a non-interactive shell stores an EMPTY value and"
-              echo "still exits 0) with a token that can read that repo's"
-              echo "releases."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [ "${{ needs.conformance.result }}" != "success" ]; then
-            echo "conformance: ${{ needs.conformance.result }}" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "### Conformance ran against a real node" >> "$GITHUB_STEP_SUMMARY"
+        run: go test ./conformance/... -v -count=1
 
   spec-drift:
     # The generated layer must match the description it claims to come from.
@@ -136,29 +96,66 @@ jobs:
           fi
 
   spec-freshness:
-    # The OTHER half of spec-drift, and the half that was missing.
+    # The OTHER half of spec-drift.
     #
-    # `spec-drift` regenerates and diffs against the VENDORED description, so
-    # it proves this client is internally consistent and says nothing about
-    # whether the vendored copy matches the server's. A client can be perfectly
-    # self-consistent and perfectly stale — this one was, and the cost was that
-    # the generated layer had no `FanOutProfile` and no `ClaimRoute` at all,
-    # months after the server started sending them.
+    # `spec-drift` proves the generated layer matches the VENDORED
+    # description, and says nothing about whether the vendored copy matches
+    # the server. A client can be perfectly self-consistent and perfectly
+    # stale — this one was, and the cost was a generated layer with no
+    # `FanOutProfile` and no `ClaimRoute` months after the server sent them.
     #
-    # Gated on the same token as conformance, because `lucenia/lucenia` is
-    # internal.
-    name: vendored description is current
+    # The server's description lives in an internal repository, so an exact
+    # diff needs a token this workflow does not have. What a released node
+    # CAN answer without one is whether every operation the vendored copy
+    # declares is actually routed — which catches this client describing, and
+    # wrapping, an operation the node does not have.
+    #
+    # Not a substitute for the exact diff: a route the server ADDED and the
+    # vendored copy lacks is invisible here. The exact diff runs too when a
+    # LUCENIA_RELEASE_TOKEN secret is present.
+    name: vendored description is served
     runs-on: ubuntu-latest
-    needs: can-reach-a-node
-    if: needs.can-reach-a-node.outputs.available == 'true'
     steps:
       - uses: actions/checkout@v4
-      - name: Diff against the server's description
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+
+      - name: Fetch the latest released node
         env:
-          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api repos/lucenia/lucenia/contents/rust/api/openapi.yaml \
+          tag=$(gh release view --repo gnarl-dev/releases --json tagName -q .tagName)
+          echo "using $tag"
+          mkdir -p node && cd node
+          gh release download "$tag" --repo gnarl-dev/releases \
+            --pattern 'gnarl-x86_64-unknown-linux-gnu.tar.gz' \
+            --pattern 'SHA256SUMS.txt'
+          grep ' ./gnarl-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt \
+            | sed 's# \./# #' | sha256sum -c -
+          tar xzf gnarl-x86_64-unknown-linux-gnu.tar.gz
+          echo "GNARL_BINARY=$PWD/gnarl" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD" >> "$GITHUB_ENV"
+
+      - name: Every described route is served
+        run: go test ./conformance/... -v -count=1 -run TestEveryDescribedRouteIsServed
+
+      - name: Exact diff against the server's description (needs a token)
+        env:
+          TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            {
+              echo "### Exact spec diff skipped"
+              echo
+              echo "No \`LUCENIA_RELEASE_TOKEN\`, so the vendored description was"
+              echo "checked against a released node's routes only, not diffed"
+              echo "against lucenia/lucenia main."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          GH_TOKEN="$TOKEN" gh api repos/lucenia/lucenia/contents/rust/api/openapi.yaml \
             --jq '.content' | base64 -d > /tmp/upstream.yaml
           if ! diff -u /tmp/upstream.yaml internal/oas/openapi.yaml; then
             echo
