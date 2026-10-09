@@ -12,7 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.23" }
+        # The floor go.mod declares, so a 1.24 caller is what CI proves works.
+        with: { go-version-file: go.mod }
       - run: go vet ./...
       - name: gofmt
         run: |
@@ -58,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.23" }
+        with: { go-version-file: go.mod }
 
       - name: Fetch a node
         env:
@@ -119,13 +120,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.23" }
-      - run: go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest
+        # tools.mod, not go.mod: the pinned generator needs a newer Go than
+        # the client does. Regenerating with `@latest` made this check depend
+        # on whatever oapi-codegen shipped that morning, so a green run proved
+        # nothing about the version that produced the checked-in code.
+        with: { go-version-file: tools.mod }
       - name: Regenerate and diff
         run: |
-          cd internal/oas
-          oapi-codegen -config config.yaml openapi.yaml
-          cd ../..
+          go generate ./internal/oas
           if ! git diff --exit-code -- internal/oas/oas.gen.go; then
             echo
             echo "internal/oas/oas.gen.go does not match openapi.yaml."

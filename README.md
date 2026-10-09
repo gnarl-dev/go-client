@@ -180,6 +180,10 @@ root package is written by hand, so it can be idiomatic. Regenerate with:
 go generate ./internal/oas
 ```
 
+The generator is pinned in `tools.mod`, not `go.mod`: it needs a newer Go than
+the client does, and a caller importing the client should not inherit that
+floor. CI regenerates with the same pin and fails if the output differs.
+
 ## Tests
 
 Four layers:
