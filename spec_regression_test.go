@@ -164,3 +164,56 @@ func TestReservedFieldNamesAreDocumented(t *testing.T) {
 		}
 	}
 }
+
+// The vendored copy must describe the surface this client wraps.
+//
+// The previous copy was 400 lines short of the server's: no `_policy`, no
+// entitlement routes, no backup schedule and no `route_not_found`. Every one of
+// those was live on the node. A method wrapping a route the vendored contract
+// does not declare has no generated types behind it, which is how a
+// hand-written struct quietly diverges from the wire.
+func TestVendoredDescriptionDeclaresTheGASurface(t *testing.T) {
+	paths, _ := loadSpec(t)["paths"].(map[string]any)
+	for _, want := range []string{
+		"/v1/indexes/{name}/_policy",
+		"/v1/indexes/{name}/_forcemerge",
+		"/v1/node/entitlement",
+		"/v1/node/entitlement/activate",
+		"/v1/namespaces",
+		"/v1/memory/remember",
+		"/v1/memory/recall",
+		"/v1/memory/answer",
+		"/v1/memory/bootstrap",
+		"/v1/memory/ingest/document",
+		"/v1/memory/ingest/messages",
+		"/v1/memory/ingest/voice",
+		"/v1/repositories/{repo}/schedule",
+		"/v1/snapshot_jobs/{id}",
+	} {
+		if _, ok := paths[want]; !ok {
+			t.Errorf("the vendored description does not declare %s", want)
+		}
+	}
+
+	types := errorTypeEnum(t)
+	if !types["route_not_found"] {
+		t.Error("the ErrorType enum is missing route_not_found, which every " +
+			"unmatched /v1 path now returns")
+	}
+}
+
+// errorTypeEnum is the set of stable error types the description promises.
+func errorTypeEnum(t *testing.T) map[string]bool {
+	t.Helper()
+	props, _ := schema(t, "ErrorBody")["properties"].(map[string]any)
+	typ, _ := props["type"].(map[string]any)
+	raw, ok := typ["enum"].([]any)
+	if !ok {
+		t.Fatal("ErrorBody.type is not an enum")
+	}
+	out := map[string]bool{}
+	for _, v := range raw {
+		out[v.(string)] = true
+	}
+	return out
+}
