@@ -118,7 +118,20 @@ func (c *Client) ListIndexesPage(ctx context.Context, after string) ([]IndexInfo
 	if raw.NextAfter != nil {
 		next = *raw.NextAfter
 	}
+	for i := range raw.Indexes {
+		publicEngine(raw.Indexes[i].EngineBinding)
+	}
 	return raw.Indexes, next, nil
+}
+
+// publicEngine renames, in place, the engine a node released before the
+// rename reports by its old internal binding. `tantivy` IS the native
+// engine; translating here means a caller never sees two names for one
+// engine, whichever node answers.
+func publicEngine(binding *string) {
+	if binding != nil && *binding == "tantivy" {
+		*binding = "native"
+	}
 }
 
 // GetSchema returns the index's current mapping.

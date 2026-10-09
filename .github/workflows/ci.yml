@@ -79,12 +79,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: toolsgo
+        run: echo "version=$(awk '$1=="go"{print $2; exit}' tools.mod)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v5
         # tools.mod, not go.mod: the pinned generator needs a newer Go than
         # the client does. Regenerating with `@latest` made this check depend
         # on whatever oapi-codegen shipped that morning, so a green run proved
         # nothing about the version that produced the checked-in code.
-        with: { go-version-file: tools.mod }
+        # setup-go parses a version out of a file only when it is named
+        # go.mod; any other file is read as a bare version string. So the
+        # `go` directive is read from tools.mod here.
+        with: { go-version: "${{ steps.toolsgo.outputs.version }}" }
       - name: Regenerate and diff
         run: |
           go generate ./internal/oas

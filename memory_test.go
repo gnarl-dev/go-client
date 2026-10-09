@@ -158,3 +158,27 @@ func TestIngestMessagesAndVoice(t *testing.T) {
 		t.Errorf("body = %s", s.Raw)
 	}
 }
+
+// A node released before the rename reports the native engine as `tantivy`.
+// Each response that carries the engine must name it `native`; this fails
+// when one of them passes the old name through.
+func TestTheEngineIsCalledNativeWhicheverNodeAnswers(t *testing.T) {
+	c, _ := replying(t, 200, `{"id":"u-1","engine_binding":"tantivy"}`)
+	r, err := c.Remember(context.Background(), RememberRequest{Content: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.EngineBinding == nil || *r.EngineBinding != "native" {
+		t.Errorf("Remember engine = %v, want native", r.EngineBinding)
+	}
+
+	c, _ = replying(t, 200, `{"indexes":[{"name":"a","engine_binding":"tantivy"},
+		{"name":"b","engine_binding":"lucene"}]}`)
+	got, _, err := c.ListIndexesPage(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || *got[0].EngineBinding != "native" || *got[1].EngineBinding != "lucene" {
+		t.Errorf("ListIndexesPage engines = %+v", got)
+	}
+}

@@ -122,6 +122,10 @@ func startNode() (addr string, stop func(), skip string) {
 		"--data-dir", dir,
 		"--single-node",
 		"--headless",
+		// The suite is one client issuing requests back to back; the
+		// per-client limit is for the public internet, and here it turned a
+		// write into rate_limited part-way through a run.
+		"--no-http-rate-limit",
 	)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr

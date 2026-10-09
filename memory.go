@@ -94,6 +94,7 @@ func (c *Client) Remember(ctx context.Context, req RememberRequest) (*Remembered
 	if err := c.do(ctx, http.MethodPost, "/v1/memory/remember", body, &out); err != nil {
 		return nil, err
 	}
+	publicEngine(out.EngineBinding)
 	return &out, nil
 }
 
