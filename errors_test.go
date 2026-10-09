@@ -134,7 +134,8 @@ func TestRetryAfterIsRead(t *testing.T) {
 
 // An error type this client has never seen must still arrive intact. Mapping
 // it onto a familiar sentinel would be worse than not mapping it: the caller
-// would branch on a guess.
+// would branch on a guess. (A 400 says nothing a sentinel could: only the
+// statuses that do — 404, 409, 429 and the rest — match by status alone.)
 func TestAnUnknownTypeIsNotRemapped(t *testing.T) {
 	err := parseError(respFor(400,
 		`{"error":{"type":"some_future_type","reason":"a new failure"}}`, nil))
@@ -178,5 +179,101 @@ func TestDetailSurvives(t *testing.T) {
 	}
 	if _, ok := e.Detail["retry_after_seconds"]; !ok {
 		t.Errorf("Detail = %v, missing retry_after_seconds", e.Detail)
+	}
+}
+
+// REGRESSION: the status fallback used to apply only when Type was empty, so
+// a 404 carrying any type the client did not know failed
+// errors.Is(err, ErrNotFound). `route_not_found` was exactly that case until
+// it was added to the map — and the next new type would have been too. A 404
+// is not found whatever the body calls it.
+func TestA404WithAnyTypeIsNotFound(t *testing.T) {
+	for _, typ := range []string{"route_not_found", "some_type_added_next_year"} {
+		err := parseError(respFor(404,
+			`{"error":{"type":"`+typ+`","reason":"gone"}}`, nil))
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("a 404 with type %q does not satisfy errors.Is(err, ErrNotFound)", typ)
+		}
+		var e *Error
+		errors.As(err, &e)
+		if e.Type != typ {
+			t.Errorf("Type = %q — the status fallback must not rewrite the type", e.Type)
+		}
+	}
+}
+
+// Every status the client has a sentinel for matches it under an unknown
+// type, and the type is never what decides it.
+func TestStatusFallbackIgnoresTheType(t *testing.T) {
+	for status, want := range map[int]error{
+		401: ErrUnauthenticated,
+		403: ErrForbidden,
+		404: ErrNotFound,
+		409: ErrConflict,
+		429: ErrRateLimited,
+		503: ErrUnavailable,
+	} {
+		err := parseError(respFor(status,
+			`{"error":{"type":"a_future_type","reason":"x"}}`, nil))
+		if !errors.Is(err, want) {
+			t.Errorf("http %d with an unknown type does not satisfy %v", status, want)
+		}
+	}
+}
+
+// The description's ErrorType enum is a promise: these are the types a node
+// may send. Every one must reach a sentinel, or a caller using errors.Is
+// cannot branch on it without string-matching Type.
+func TestEveryDescribedErrorTypeHasASentinel(t *testing.T) {
+	for typ := range errorTypeEnum(t) {
+		if _, ok := sentinelFor[typ]; !ok {
+			t.Errorf("error type %q is in the description's enum but maps to no sentinel", typ)
+		}
+	}
+	// And the reverse: a type this client maps but the server no longer
+	// describes is dead weight that hides a rename.
+	described := errorTypeEnum(t)
+	for typ := range sentinelFor {
+		if !described[typ] {
+			t.Errorf("sentinelFor maps %q, which the description does not declare", typ)
+		}
+	}
+}
+
+// The BYOK wrong-key refusal is a 403 the node types `unauthorized`.
+func TestWrongNamespaceKeyIsForbidden(t *testing.T) {
+	err := parseError(respFor(403,
+		`{"error":{"type":"unauthorized","reason":"invalid key for namespace"}}`, nil))
+	if !errors.Is(err, ErrForbidden) {
+		t.Error("unauthorized (403) does not satisfy ErrForbidden")
+	}
+	if errors.Is(err, ErrUnauthenticated) {
+		t.Error("a wrong BYOK key is not a missing credential")
+	}
+}
+
+func TestSnapshotConflictsAreConflicts(t *testing.T) {
+	for _, typ := range []string{"job_in_progress", "namespace_not_snapshottable", "unverified_signer"} {
+		err := parseError(respFor(409, `{"error":{"type":"`+typ+`","reason":"x"}}`, nil))
+		if !errors.Is(err, ErrConflict) {
+			t.Errorf("%s does not satisfy ErrConflict", typ)
+		}
+	}
+}
+
+func TestRetryAfterAcceptsAnHTTPDate(t *testing.T) {
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	date := now.Add(90 * time.Second).Format(http.TimeFormat)
+	if got := parseRetryAfter(date, now); got != 90*time.Second {
+		t.Errorf("parseRetryAfter(%q) = %v, want 90s", date, got)
+	}
+	if got := parseRetryAfter(now.Add(-time.Hour).Format(http.TimeFormat), now); got != 0 {
+		t.Errorf("a date in the past gave %v, want 0", got)
+	}
+	if got := parseRetryAfter("-3", now); got != 0 {
+		t.Errorf("negative seconds gave %v, want 0", got)
+	}
+	if got := parseRetryAfter("soon", now); got != 0 {
+		t.Errorf("garbage gave %v, want 0", got)
 	}
 }
