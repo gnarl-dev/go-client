@@ -70,7 +70,8 @@ func newFake(t *testing.T, handler func(w http.ResponseWriter, r *http.Request, 
 		handler(w, r, n)
 	}))
 	t.Cleanup(srv.Close)
-	c, err := New(srv.URL)
+	t.Setenv(EnvToken, "")
+	c, err := New(srv.URL, WithRetry(RetryPolicy{MaxAttempts: 3, BaseDelay: 1, MaxDelay: 1e9}))
 	if err != nil {
 		t.Fatal(err)
 	}
