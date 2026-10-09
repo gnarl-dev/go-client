@@ -227,6 +227,73 @@ paths:
         "404":
           $ref: "#/components/responses/IndexNotFoundError"
 
+  /v1/indexes/{name}/_policy:
+    parameters:
+      - $ref: "#/components/parameters/IndexName"
+
+    get:
+      operationId: getIndexPolicy
+      tags: [indexes]
+      summary: Get how far this index's data may travel
+      description: |
+        Placement governs which peers may hold a replica of this index. It is
+        enforced by the index's ORIGIN when it chooses replica candidates, so a
+        narrowing takes effect without any peer having to cooperate.
+      responses:
+        "200":
+          description: The index's placement policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexPolicy"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
+    put:
+      operationId: putIndexPolicy
+      tags: [indexes]
+      summary: Change how far this index's data may travel
+      description: |
+        ORIGIN ONLY. Only the node that created an index may change where its
+        data is allowed to go; any other node answers 403. A peer that could
+        widen someone else's index could pull their private data onto the public
+        fabric.
+
+        Omitted fields are left unchanged, so a partial request can narrow
+        placement without restating a replication factor the caller does not
+        know — and cannot widen anything by accident.
+
+        Narrowing takes effect on the next anti-entropy cycle and DROPS replicas
+        already held, rather than only declining new ones.
+
+        `replication_factor` above the node's ceiling is rejected: an unbounded
+        factor would conscript storage across the whole fabric.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexPolicyUpdate"
+      responses:
+        "200":
+          description: The policy now in force
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexPolicy"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "403":
+          description: |
+            This node is not the index's origin, so it may not change where the
+            index's data is placed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/IndexNotFoundError"
+
   # --- Document operations ------------------------------------------------
 
   /v1/indexes/{name}/_doc:
@@ -324,6 +391,28 @@ paths:
       operationId: bulkIndex
       tags: [documents]
       summary: Bulk index documents
+      description: |
+        Write many documents in one request.
+
+        **A malformed document costs that document, not the batch.** Each is
+        validated against the schema on its own; the ones that pass are
+        written, and the ones that fail come back as `items[i]` with
+        `status: 400` and an `error`. `items` is in REQUEST ORDER, so the
+        position identifies the document — a reason naming only the field is
+        not much help across a thousand documents that share it.
+
+        Read `errors` first, then walk `items` for the ones carrying an
+        `error`. **A 200 does not mean every document landed.**
+
+        This is not a transaction, and could not be: a batch fans out across
+        the claims its documents route to, which may be held by different
+        peers. Writes are idempotent by `_id`, so a caller who fixes the bad
+        documents and resubmits the whole batch converges rather than
+        double-writing.
+
+        When EVERY document fails validation the answer is still `200` with
+        every item at `400` — the same shape as one failing out of a thousand,
+        so reading the outcome takes one code path rather than two.
       requestBody:
         required: true
         content:
@@ -926,6 +1015,87 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+
+  /v1/node/entitlement:
+    get:
+      operationId: nodeEntitlement
+      tags: [node]
+      summary: What subscription this node holds
+      description: >-
+        Three states, not two. `active` is verified now; `refused` is a token
+        that is present and rejected -- expired, or signed by a key this build
+        does not trust; neither means no subscription was ever bought.
+        Collapsing refused into absent tells somebody who has paid that they
+        have not, and sends them to buy a second one.
+
+        `enforced` is false on a build with no signing keys compiled in, where
+        nothing is gated and there is nothing to activate.
+      responses:
+        "200":
+          description: Subscription status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+                  refused:
+                    # OpenAPI 3.1: a union with "null", not 3.0's `nullable`.
+                    type: [string, "null"]
+                    description: Why a present token was rejected.
+                  tier: { type: [string, "null"] }
+                  features:
+                    type: array
+                    items: { type: string }
+                  mesh_id: { type: [string, "null"] }
+                  not_after:
+                    type: [integer, "null"]
+                    format: int64
+                    description: >-
+                      Expiry as epoch SECONDS, not milliseconds. Reading it as
+                      milliseconds puts the date in 1970.
+                  enforced: { type: boolean }
+                required: [active, features, enforced]
+
+  /v1/node/entitlement/activate:
+    post:
+      operationId: nodeActivateEntitlement
+      tags: [node]
+      summary: Activate a subscription from a pasted key
+      description: >-
+        Accepts the single-line `gnarl-ent1.` form shown on the account page,
+        and also the raw signed-entitlement JSON, because both are things a
+        person legitimately has.
+
+        The key is VERIFIED before it is stored. A refusal is a 400 naming
+        which failure occurred -- malformed, expired, or signed by an
+        untrusted key -- because "invalid" sends somebody to buy a second
+        subscription when what they need is the newer key already on their
+        account page.
+
+        Scope is decided at node start, so the node keeps its previous scope
+        until it restarts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key:
+                  type: string
+                  description: The activation key, as pasted.
+              required: [key]
+      responses:
+        "200":
+          description: Activated. The stored subscription.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: The key was refused, with the reason.
+        "503":
+          description: This node has nowhere to store a subscription.
 
   /v1/node/updates/check:
     get:
@@ -1558,6 +1728,141 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/repositories/{repo}/schedule:
+    parameters:
+      - name: repo
+        in: path
+        required: true
+        schema: { type: string }
+
+    get:
+      operationId: getBackupSchedule
+      tags: [snapshots]
+      summary: When this repository is backed up automatically
+      description: >
+        Returns null when the repository exists and has no schedule, which is
+        a different answer from 404 — the first means "nothing scheduled", the
+        second means "no such repository".
+
+
+        `nextDueInSeconds` and `nextSnapshotName` are DERIVED on each read,
+        never stored. A stored "next run" is wrong the moment the clock moves
+        or the cadence changes.
+      responses:
+        "200":
+          description: The schedule, or null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  schedule:
+                    oneOf:
+                      - $ref: "#/components/schemas/BackupSchedule"
+                      - type: "null"
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    put:
+      operationId: setBackupSchedule
+      tags: [snapshots]
+      summary: Back this repository up on a cadence
+      description: >
+        Scheduling is free and ungated, against any repository — including
+        storage the operator rents elsewhere. Snapshot and restore have always
+        been free and this is part of them; what a Gnarl subscription sells is
+        a bucket we operate, which is enforced by the credential that reaches
+        it rather than by a flag here.
+
+
+        UTC WINDOWS, NOT A TIMER. The node divides time into fixed windows and
+        asks on each tick whether the current one has been taken. A machine
+        that was asleep at the scheduled moment still gets its backup when it
+        wakes; a restart does not re-run one already taken; and two nodes
+        derive the same snapshot name for the same window without
+        coordinating, so the second finds the first one's backup already
+        there.
+
+
+        Editing a schedule keeps the progress already made, so changing the
+        cadence or the prefix never costs a duplicate backup.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target, everyHours]
+              properties:
+                target:
+                  type: string
+                  description: The index to back up, as a manual snapshot names it.
+                everyHours:
+                  type: integer
+                  minimum: 1
+                  maximum: 168
+                  description: >
+                    One hour to one week. The floor is not taste: a backup has
+                    to finish before the next is due.
+                enabled:
+                  type: boolean
+                  default: true
+                  description: Off without forgetting the settings; DELETE is the other verb.
+                prefix:
+                  type: string
+                  default: auto
+                  description: >
+                    Leading component of each generated snapshot name. Lower-case
+                    letters, digits and '-' only — it becomes part of an object
+                    key, and a '/' would write the descriptor where neither a
+                    listing nor a retention rule scoped to `snapshots/` can see it.
+      responses:
+        "200":
+          description: The schedule as stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  schedule: { $ref: "#/components/schemas/BackupSchedule" }
+        "400":
+          description: The cadence or prefix is outside what can work; the message names the bound
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No such repository
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    delete:
+      operationId: clearBackupSchedule
+      tags: [snapshots]
+      summary: Stop backing this repository up automatically
+      description: >
+        The backups already taken are untouched, exactly as unregistering a
+        repository leaves its data. Removing a schedule that is not there is
+        not an error.
+      responses:
+        "200":
+          description: Whether a schedule was removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repository: { type: string }
+                  removed: { type: boolean }
+
   /v1/repositories/{repo}/snapshots:
     parameters:
       - name: repo
@@ -1991,7 +2296,7 @@ components:
               detail:
                 field: location
                 field_type: geo_point
-                engine: tantivy
+                engine: native
 
     RateLimited:
       description: >
@@ -2143,6 +2448,45 @@ components:
             restore would replace what it serves, and the next query would
             simply return older data with nothing to say it happened.
 
+    BackupSchedule:
+      type: object
+      description: An automatic backup, and what has happened to it.
+      properties:
+        target:
+          type: string
+          description: The index this schedule backs up.
+        everyHours:
+          type: integer
+          description: Cadence, 1 to 168 hours.
+        enabled: { type: boolean }
+        prefix:
+          type: string
+          description: Leading component of each generated snapshot name.
+        lastWindow:
+          oneOf:
+            - type: integer
+              format: int64
+            - type: "null"
+          description: >
+            Start of the most recent window this node completed, epoch SECONDS.
+            A FAILED attempt does not advance it — the window stays open so the
+            next tick retries, and a network blip does not cost the whole day's
+            backup.
+        lastError:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: Why the last attempt failed, if it did. Cleared by a success.
+        nextDueInSeconds:
+          type: integer
+          format: int64
+          description: Derived on read, never stored.
+        nextSnapshotName:
+          type: string
+          description: >
+            What the next backup will be called. Derived from the UTC window, so
+            every node computes the same name for the same window.
+
     SnapshotJob:
       type: object
       properties:
@@ -2277,6 +2621,12 @@ components:
             # mapping or deployment problem and the other is the ordinary
             # answer to looking up a key that is not there.
             - document_not_found
+            # No route is mounted at that path. Distinct from
+            # index_not_found, which says the route exists and the index does
+            # not. Before this type, an unmatched /v1 path fell through to the
+            # Console's SPA fallback and returned 200 with an HTML body, so a
+            # typo or a renamed endpoint was indistinguishable from success.
+            - route_not_found
             - index_already_exists
             - field_not_found
             - schema_error
@@ -2319,6 +2669,61 @@ components:
       properties:
         schema:
           $ref: "#/components/schemas/IndexSchema"
+
+    IndexPlacement:
+      type: string
+      description: |
+        How far an index's data may travel.
+
+        * `local`  — never leaves this node; no replicas anywhere.
+        * `mesh`   — replicas only among this node's own mesh peers. The
+          default. On a node whose scope is public there is no such thing as
+          "our mesh peers", so this means only peers on the admission
+          allowlist — which is what lets one node serve the public fabric while
+          keeping a private index on its owner's own devices.
+        * `public` — any peer, including strangers on the public fabric.
+      enum: [local, mesh, public]
+
+    IndexPolicy:
+      type: object
+      required: [placement]
+      properties:
+        placement:
+          $ref: "#/components/schemas/IndexPlacement"
+        replication_factor:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Replicas wanted for this index. Absent means the node-wide default.
+            Private memory wants 1-2 across its owner's devices; public-internet
+            content needs far more to survive churn, and one node-wide number
+            cannot serve both.
+        embedder_profile:
+          type: string
+          description: |
+            Which embedder produced this index's vectors, e.g. `local_minilm:384`.
+            READ-ONLY — it records what actually wrote the data, so it is not
+            accepted on update. Absent means unknown, which is never to be read
+            as "compatible".
+      example:
+        placement: mesh
+        replication_factor: 2
+        embedder_profile: local_minilm:384
+
+    IndexPolicyUpdate:
+      type: object
+      description: |
+        A partial change. Omitted fields are left as they are.
+      properties:
+        placement:
+          $ref: "#/components/schemas/IndexPlacement"
+        replication_factor:
+          type: integer
+          format: int32
+          minimum: 0
+      example:
+        placement: local
 
     IndexSchema:
       type: object
@@ -2423,9 +2828,9 @@ components:
         engine_binding:
           type: string
           description: |
-            The engine this index is bound to (e.g. `tantivy`). Binding is
-            decided at creation from the schema's field types and is
-            immutable afterwards.
+            The engine this index is bound to: `native` (Lucenia's built-in
+            engine) or `lucene` (the JVM engine). Binding is decided at
+            creation from the schema's field types and is immutable afterwards.
         created_at:
           type: string
           format: date-time
@@ -3220,7 +3625,7 @@ components:
             nested point object.
 
 
-            Engine support is not universal: the tantivy engine refuses this
+            Engine support is not universal: the native engine refuses this
             with `400 unsupported_engine`. Where it IS served, ordering is
             done by the serving engine and cannot be re-ordered by the
             coordinator, so on an index with more than one claim the result is

@@ -143,6 +143,27 @@ func deref(qs []*Query) []Query {
 	return out
 }
 
+// ─── Sort ───────────────────────────────────────────────────────────────────
+
+// SortClause is one sort key in a SearchRequest.
+type SortClause = oas.SortClause
+
+// SortAsc orders by field, smallest first. The field must be sortable:
+// numeric, date or boolean — keyword and text fields are refused.
+func SortAsc(field string) SortClause { return sortBy(field, oas.SortClause2OrderAsc) }
+
+// SortDesc orders by field, largest first.
+func SortDesc(field string) SortClause { return sortBy(field, oas.SortClause2OrderDesc) }
+
+func sortBy(field string, order oas.SortClause2Order) SortClause {
+	var c SortClause
+	clause := oas.SortClause2{field: {Order: &order}}
+	if err := c.FromSortClause2(clause); err != nil {
+		panic("gnarl: sort: encoding a field sort cannot fail: " + err.Error())
+	}
+	return c
+}
+
 // ─── Schema helpers ─────────────────────────────────────────────────────────
 
 // NewSchema builds an index schema from field definitions.
@@ -156,6 +177,13 @@ func TextField() Field { return Field{Type: oas.Text} }
 // KeywordField is an exact-match field: not analyzed, suitable for Term,
 // filtering and sorting.
 func KeywordField() Field { return Field{Type: oas.Keyword} }
+
+// LongField holds a 64-bit integer: sortable, and usable as a SearchAll
+// cursor.
+func LongField() Field { return Field{Type: oas.Long} }
+
+// DateField holds a timestamp: sortable, and usable as a SearchAll cursor.
+func DateField() Field { return Field{Type: oas.Date} }
 
 // GeoPointField holds a lat/lon point, queryable with GeoDistance.
 func GeoPointField() Field { return Field{Type: oas.GeoPoint} }

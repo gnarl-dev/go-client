@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/gnarl-dev/go-client/internal/oas"
 )
@@ -30,6 +31,15 @@ type (
 	BulkResult = oas.BulkIndexResponse
 	// BulkItem is the outcome of one document within a bulk request.
 	BulkItem = oas.BulkItemResult
+	// BulkAck is the durability a bulk batch reached.
+	BulkAck = oas.BulkIndexResponseAck
+)
+
+// Bulk acknowledgement levels, weakest first.
+const (
+	AckAccepted         = oas.BulkIndexResponseAckAccepted
+	AckAcceptedDurably  = oas.BulkIndexResponseAckAcceptedDurably
+	AckVisibleForSearch = oas.BulkIndexResponseAckVisibleForSearch
 )
 
 // ─── Indexes ────────────────────────────────────────────────────────────────
@@ -108,7 +118,20 @@ func (c *Client) ListIndexesPage(ctx context.Context, after string) ([]IndexInfo
 	if raw.NextAfter != nil {
 		next = *raw.NextAfter
 	}
+	for i := range raw.Indexes {
+		publicEngine(raw.Indexes[i].EngineBinding)
+	}
 	return raw.Indexes, next, nil
+}
+
+// publicEngine renames, in place, the engine a node released before the
+// rename reports by its old internal binding. `tantivy` IS the native
+// engine; translating here means a caller never sees two names for one
+// engine, whichever node answers.
+func publicEngine(binding *string) {
+	if binding != nil && *binding == "tantivy" {
+		*binding = "native"
+	}
 }
 
 // GetSchema returns the index's current mapping.
@@ -128,6 +151,79 @@ func (c *Client) Count(ctx context.Context, name string) (int64, error) {
 	}
 	err := c.do(ctx, http.MethodGet, "/v1/indexes/"+pathEscape(name)+"/_count", nil, &out)
 	return out.Count, err
+}
+
+// IndexPolicy is how far an index's data may travel, and how many replicas
+// it wants.
+type IndexPolicy = oas.IndexPolicy
+
+// IndexPolicyUpdate is a partial policy change: nil fields are left alone.
+type IndexPolicyUpdate = oas.IndexPolicyUpdate
+
+// IndexPlacement says which peers may hold a replica of an index.
+type IndexPlacement = oas.IndexPlacement
+
+// The three placements, narrowest first.
+const (
+	// PlacementLocal never leaves this node: no replicas anywhere.
+	PlacementLocal = oas.IndexPlacementLocal
+	// PlacementMesh replicates only among this node's own mesh peers. The
+	// default.
+	PlacementMesh = oas.IndexPlacementMesh
+	// PlacementPublic lets any peer hold a replica, strangers included.
+	PlacementPublic = oas.IndexPlacementPublic
+)
+
+// GetPolicy returns the index's placement policy.
+func (c *Client) GetPolicy(ctx context.Context, name string) (*IndexPolicy, error) {
+	var out IndexPolicy
+	if err := c.do(ctx, http.MethodGet, "/v1/indexes/"+pathEscape(name)+"/_policy", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PutPolicy changes the index's placement policy and returns the policy now
+// in force.
+//
+// Only the node that created the index may do this; any other answers 403
+// (errors.Is(err, ErrForbidden)). A narrowing drops replicas already held on
+// the next anti-entropy cycle, rather than only declining new ones.
+func (c *Client) PutPolicy(ctx context.Context, name string, update IndexPolicyUpdate) (*IndexPolicy, error) {
+	var out IndexPolicy
+	if err := c.do(ctx, http.MethodPut, "/v1/indexes/"+pathEscape(name)+"/_policy", update, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ForceMergeResult is what a force merge left behind.
+type ForceMergeResult struct {
+	// Segments is the segment count after the merge, across the claims this
+	// node holds.
+	Segments int `json:"segments"`
+
+	// Partial is true when some of the index's claims live on other nodes,
+	// so only the local ones were merged.
+	Partial bool `json:"partial"`
+}
+
+// ForceMerge merges each local claim of the index down to at most
+// maxSegments segments. Zero or less means the node's default of one.
+//
+// Expensive and I/O-heavy: run it in a quiet period, not on a hot path. It is
+// not retried on 429 or 503, because a second merge queued behind the first
+// doubles the cost of the thing you were told to back off from.
+func (c *Client) ForceMerge(ctx context.Context, name string, maxSegments int) (*ForceMergeResult, error) {
+	path := "/v1/indexes/" + pathEscape(name) + "/_forcemerge"
+	if maxSegments > 0 {
+		path += "?max_num_segments=" + strconv.Itoa(maxSegments)
+	}
+	var out ForceMergeResult
+	if err := c.do(ctx, http.MethodPost, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ─── Documents ──────────────────────────────────────────────────────────────
@@ -207,28 +303,15 @@ func (c *Client) DeleteDocument(ctx context.Context, index, id string) error {
 // assuming the batch succeeded: a bulk request can return 200 with individual
 // items failed, which is the single most common way to lose writes silently.
 func (c *Client) Bulk(ctx context.Context, index string, docs []any) (*BulkResult, error) {
-	if len(docs) == 0 {
-		return nil, fmt.Errorf("gnarl: Bulk: no documents")
-	}
-	encoded := make([]map[string]json.RawMessage, 0, len(docs))
+	withIDs := make([]BulkDoc, len(docs))
 	for i, d := range docs {
-		f, err := documentBody("", d)
-		if err != nil {
-			return nil, fmt.Errorf("gnarl: Bulk: document %d: %w", i, err)
-		}
-		encoded = append(encoded, f)
+		withIDs[i] = BulkDoc{Document: d}
 	}
-	var out BulkResult
-	path := "/v1/indexes/" + pathEscape(index) + "/_bulk"
-	body := map[string]any{"documents": encoded}
-	if err := c.do(ctx, http.MethodPost, path, body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return c.bulk(ctx, "/v1/indexes/"+pathEscape(index)+"/_bulk", "Bulk", withIDs)
 }
 
 // BulkDoc pairs an explicit document id with its content, for a bulk request
-// where the ids matter.
+// where the ids matter. An empty ID has the node generate one.
 type BulkDoc struct {
 	ID       string
 	Document any
@@ -236,19 +319,23 @@ type BulkDoc struct {
 
 // BulkWithIDs is Bulk for documents whose ids you choose.
 func (c *Client) BulkWithIDs(ctx context.Context, index string, docs []BulkDoc) (*BulkResult, error) {
+	return c.bulk(ctx, "/v1/indexes/"+pathEscape(index)+"/_bulk", "BulkWithIDs", docs)
+}
+
+// bulk sends one batch to an index's or a namespace's _bulk.
+func (c *Client) bulk(ctx context.Context, path, op string, docs []BulkDoc) (*BulkResult, error) {
 	if len(docs) == 0 {
-		return nil, fmt.Errorf("gnarl: BulkWithIDs: no documents")
+		return nil, fmt.Errorf("gnarl: %s: no documents", op)
 	}
 	encoded := make([]map[string]json.RawMessage, 0, len(docs))
 	for i, d := range docs {
 		f, err := documentBody(d.ID, d.Document)
 		if err != nil {
-			return nil, fmt.Errorf("gnarl: BulkWithIDs: document %d: %w", i, err)
+			return nil, fmt.Errorf("gnarl: %s: document %d: %w", op, i, err)
 		}
 		encoded = append(encoded, f)
 	}
 	var out BulkResult
-	path := "/v1/indexes/" + pathEscape(index) + "/_bulk"
 	if err := c.do(ctx, http.MethodPost, path, map[string]any{"documents": encoded}, &out); err != nil {
 		return nil, err
 	}
@@ -323,6 +410,16 @@ type SearchRequest struct {
 	// The node clamps this to its own configured timeout: you may ask for
 	// less time, never more.
 	DeadlineMS int64
+
+	// Sort orders the hits. Build clauses with SortAsc and SortDesc. Empty
+	// means relevance. SearchAll requires one, because a cursor is only
+	// meaningful over an explicit order.
+	Sort []SortClause
+
+	// SearchAfter is a keyset cursor: the Sort values of the last hit of the
+	// previous page. From is ignored when it is set. SearchAll manages it
+	// for you.
+	SearchAfter []any
 }
 
 // SearchResponse is the result of a search.
@@ -376,6 +473,12 @@ func (c *Client) Search(ctx context.Context, index string, req SearchRequest) (*
 	if index == "" {
 		return nil, fmt.Errorf("gnarl: Search: empty index name")
 	}
+	return c.search(ctx, "/v1/indexes/"+pathEscape(index)+"/_search", req)
+}
+
+// search runs req against path — an index's or a namespace's _search, which
+// take the same body and answer with the same shape.
+func (c *Client) search(ctx context.Context, path string, req SearchRequest) (*SearchResponse, error) {
 	body := oas.SearchRequest{Query: req.Query}
 	if req.Size > 0 {
 		body.Size = &req.Size
@@ -393,10 +496,15 @@ func (c *Client) Search(ctx context.Context, index string, req SearchRequest) (*
 		ms := req.DeadlineMS
 		body.Scope = &oas.QueryScope{DeadlineMs: &ms}
 	}
+	if len(req.Sort) > 0 {
+		body.Sort = &req.Sort
+	}
+	if len(req.SearchAfter) > 0 {
+		body.SearchAfter = &req.SearchAfter
+	}
 
 	var raw oas.SearchResponse
-	path := "/v1/indexes/" + pathEscape(index) + "/_search"
-	if err := c.do(ctx, http.MethodPost, path, body, &raw); err != nil {
+	if err := c.doRead(ctx, path, body, &raw); err != nil {
 		return nil, err
 	}
 

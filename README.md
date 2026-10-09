@@ -85,7 +85,9 @@ case err != nil:
 ```
 
 A `*gnarl.Error` carries `Type`, `Reason`, `Status`, an optional `Detail`
-block, and `RetryAfter` on a 429:
+block, and `RetryAfter` on a 429. The sentinels match on the HTTP status too,
+whatever the type, so a `404` is `ErrNotFound` even for a type added after
+this client was built:
 
 ```go
 _, err := c.Search(ctx, "places", gnarl.SearchRequest{Query: gnarl.MatchAll()})
@@ -125,6 +127,136 @@ if errors.As(err, &incomplete) {
 
 Every response carries `Coverage` whether you ask for completeness or not.
 
+## Walking a large result
+
+`SearchAll` follows the `search_after` cursor for you. It needs an explicit
+sort — the cursor is the last hit's sort values — and costs the same per page
+whether it is the first or the ten-thousandth:
+
+```go
+for hit, err := range c.SearchAll(ctx, "events", gnarl.SearchRequest{
+    Query: gnarl.MatchAll(),
+    Sort:  []gnarl.SortClause{gnarl.SortAsc("ts")},
+    Size:  500, // per page
+}) {
+    if err != nil {
+        return err
+    }
+    log.Println(hit.UnderscoreId)
+}
+```
+
+`BulkChunked` splits a large import into bounded requests and merges the
+per-item results, in order. Check `FailedItems` exactly as for `Bulk`.
+
+## Retries
+
+A `429` or `503` on an idempotent request — GET, PUT, DELETE, and the POSTs
+that only read, such as search and recall — is retried up to three times,
+honouring `Retry-After`. A `Retry-After` longer than the cap is returned to
+you rather than shortened. Writes sent by POST are never repeated: a `503` does
+not prove the node did not apply them.
+
+```go
+c, err := gnarl.New("https://localhost:8080",
+    gnarl.WithRetry(gnarl.RetryPolicy{MaxAttempts: 5, BaseDelay: 100 * time.Millisecond, MaxDelay: 30 * time.Second}))
+_, _ = c, err
+
+noRetry, err := gnarl.New("https://localhost:8080", gnarl.WithoutRetry())
+_, _ = noRetry, err
+```
+
+## Subscription
+
+```go
+e, err := c.Entitlement(ctx)
+if err != nil {
+    return err
+}
+switch {
+case e.Active:
+    log.Printf("%s until %s", e.Tier, e.NotAfter.Format(time.DateOnly))
+case e.Refused != "":
+    // A key is present and was rejected — expired, or signed by a key this
+    // build does not trust. This is NOT "never bought".
+    log.Printf("refused: %s", e.Refused)
+}
+
+if _, err := c.ActivateEntitlement(ctx, os.Getenv("GNARL_ACTIVATION_KEY")); err != nil {
+    var ge *gnarl.Error
+    if errors.As(err, &ge) {
+        log.Printf("not activated: %s", ge.Reason) // says which failure
+    }
+}
+```
+
+## Agent memory
+
+```go
+_, err := c.Remember(ctx, gnarl.RememberRequest{
+    MemoryScope: gnarl.MemoryScope{Space: "personal"},
+    Content:     "the oven runs 15 degrees hot",
+})
+if err != nil {
+    return err
+}
+
+got, err := c.Recall(ctx, gnarl.RecallRequest{
+    MemoryScope: gnarl.MemoryScope{Space: "personal"},
+    Query:       "oven temperature",
+    K:           5,
+})
+if err != nil {
+    return err
+}
+for _, m := range got.Memories {
+    log.Printf("%.2f %s", m.Score, m.Content)
+}
+```
+
+`personal` stays on the device; `household` is replicated to mesh peers.
+`IngestDocument` has no default space for exactly that reason.
+
+## Namespaces
+
+Many lightweight tenants, no index to create first — name one and write:
+
+```go
+tenant := c.Namespace("acme")
+if _, err := tenant.IndexDocument(ctx, "inv-1", map[string]any{"total": 42}); err != nil {
+    return err
+}
+res, err := tenant.Search(ctx, gnarl.SearchRequest{Query: gnarl.MatchAll()})
+if err != nil {
+    return err
+}
+log.Printf("%d hits, isolated to acme", len(res.Hits))
+```
+
+## Backup and restore
+
+```go
+_, err := c.RegisterRepository(ctx, "nightly", gnarl.FSRepository{Location: "/var/backups/gnarl"})
+if err != nil {
+    return err
+}
+job, err := c.SnapshotIndex(ctx, "nightly", "places-2026-10-09", "places")
+if err != nil {
+    return err
+}
+// A failed job is an error, so checking err is enough.
+if _, err := c.WaitForJob(ctx, *job.Id, time.Second); err != nil {
+    return err
+}
+
+// Or let the node do it: one backup per UTC day, taken when the window opens
+// or when the machine next wakes.
+_, err = c.SetBackupSchedule(ctx, "nightly", gnarl.ScheduleRequest{
+    Target: "places", Every: 24 * time.Hour,
+})
+return err
+```
+
 ## Two things that surprise people
 
 **`geo_distance` is flat, and the radius is metres.** Not the Elasticsearch
@@ -159,6 +291,18 @@ if err != nil {
 _ = authed
 ```
 
+Both have environment defaults: `gnarl.New("")` reads the address from
+`$GNARL_URL`, and a client given no `WithToken` sends `$GNARL_TOKEN` if it is
+set. `WithToken("")` opts out explicitly.
+
+```go
+fromEnv, err := gnarl.New("") // $GNARL_URL, $GNARL_TOKEN
+if err != nil {
+    return err
+}
+_ = fromEnv
+```
+
 **A node serves TLS by default.** `lucenia start` listens on **8080** over
 **https** with a self-signed certificate it generates on first run; `--no-tls`
 turns that off, and the desktop build uses it, but a node started with the plain
@@ -179,6 +323,10 @@ root package is written by hand, so it can be idiomatic. Regenerate with:
 ```bash
 go generate ./internal/oas
 ```
+
+The generator is pinned in `tools.mod`, not `go.mod`: it needs a newer Go than
+the client does, and a caller importing the client should not inherit that
+floor. CI regenerates with the same pin and fails if the output differs.
 
 ## Tests
 

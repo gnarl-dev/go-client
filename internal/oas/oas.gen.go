@@ -70,6 +70,7 @@ const (
 	ErrorBodyTypeRateLimited               ErrorBodyType = "rate_limited"
 	ErrorBodyTypeRepositoryError           ErrorBodyType = "repository_error"
 	ErrorBodyTypeRepositoryNotFound        ErrorBodyType = "repository_not_found"
+	ErrorBodyTypeRouteNotFound             ErrorBodyType = "route_not_found"
 	ErrorBodyTypeSchemaError               ErrorBodyType = "schema_error"
 	ErrorBodyTypeSharedPool                ErrorBodyType = "shared_pool"
 	ErrorBodyTypeSnapshotNotFound          ErrorBodyType = "snapshot_not_found"
@@ -105,6 +106,8 @@ func (e ErrorBodyType) Valid() bool {
 	case ErrorBodyTypeRepositoryError:
 		return true
 	case ErrorBodyTypeRepositoryNotFound:
+		return true
+	case ErrorBodyTypeRouteNotFound:
 		return true
 	case ErrorBodyTypeSchemaError:
 		return true
@@ -330,6 +333,27 @@ func (e IndexDocumentResponseAck) Valid() bool {
 	case IndexDocumentResponseAckAcceptedDurably:
 		return true
 	case IndexDocumentResponseAckVisibleForSearch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for IndexPlacement.
+const (
+	IndexPlacementLocal  IndexPlacement = "local"
+	IndexPlacementMesh   IndexPlacement = "mesh"
+	IndexPlacementPublic IndexPlacement = "public"
+)
+
+// Valid indicates whether the value is a known member of the IndexPlacement enum.
+func (e IndexPlacement) Valid() bool {
+	switch e {
+	case IndexPlacementLocal:
+		return true
+	case IndexPlacementMesh:
+		return true
+	case IndexPlacementPublic:
 		return true
 	default:
 		return false
@@ -629,29 +653,55 @@ func (e ListNamespaces200JSONResponseBodyNamespacesPromotion) Valid() bool {
 
 // Defines values for NodeStatus200JSONResponseBodyMode.
 const (
-	DevMesh    NodeStatus200JSONResponseBodyMode = "dev-mesh"
-	Lan        NodeStatus200JSONResponseBodyMode = "lan"
-	Private    NodeStatus200JSONResponseBodyMode = "private"
-	Public     NodeStatus200JSONResponseBodyMode = "public"
-	SingleNode NodeStatus200JSONResponseBodyMode = "single-node"
+	NodeStatus200JSONResponseBodyModeDevMesh    NodeStatus200JSONResponseBodyMode = "dev-mesh"
+	NodeStatus200JSONResponseBodyModeLan        NodeStatus200JSONResponseBodyMode = "lan"
+	NodeStatus200JSONResponseBodyModePrivate    NodeStatus200JSONResponseBodyMode = "private"
+	NodeStatus200JSONResponseBodyModePublic     NodeStatus200JSONResponseBodyMode = "public"
+	NodeStatus200JSONResponseBodyModeSingleNode NodeStatus200JSONResponseBodyMode = "single-node"
 )
 
 // Valid indicates whether the value is a known member of the NodeStatus200JSONResponseBodyMode enum.
 func (e NodeStatus200JSONResponseBodyMode) Valid() bool {
 	switch e {
-	case DevMesh:
+	case NodeStatus200JSONResponseBodyModeDevMesh:
 		return true
-	case Lan:
+	case NodeStatus200JSONResponseBodyModeLan:
 		return true
-	case Private:
+	case NodeStatus200JSONResponseBodyModePrivate:
 		return true
-	case Public:
+	case NodeStatus200JSONResponseBodyModePublic:
 		return true
-	case SingleNode:
+	case NodeStatus200JSONResponseBodyModeSingleNode:
 		return true
 	default:
 		return false
 	}
+}
+
+// BackupSchedule An automatic backup, and what has happened to it.
+type BackupSchedule struct {
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// EveryHours Cadence, 1 to 168 hours.
+	EveryHours *int `json:"everyHours,omitempty"`
+
+	// LastError Why the last attempt failed, if it did. Cleared by a success.
+	LastError *string `json:"lastError,omitempty"`
+
+	// LastWindow Start of the most recent window this node completed, epoch SECONDS. A FAILED attempt does not advance it — the window stays open so the next tick retries, and a network blip does not cost the whole day's backup.
+	LastWindow *int64 `json:"lastWindow,omitempty"`
+
+	// NextDueInSeconds Derived on read, never stored.
+	NextDueInSeconds *int64 `json:"nextDueInSeconds,omitempty"`
+
+	// NextSnapshotName What the next backup will be called. Derived from the UTC window, so every node computes the same name for the same window.
+	NextSnapshotName *string `json:"nextSnapshotName,omitempty"`
+
+	// Prefix Leading component of each generated snapshot name.
+	Prefix *string `json:"prefix,omitempty"`
+
+	// Target The index this schedule backs up.
+	Target *string `json:"target,omitempty"`
 }
 
 // BoolQuery defines model for BoolQuery.
@@ -1109,12 +1159,64 @@ type IndexMetadata struct {
 	ClaimCount int        `json:"claim_count"`
 	CreatedAt  *time.Time `json:"created_at,omitempty"`
 
-	// EngineBinding The engine this index is bound to (e.g. `tantivy`). Binding is
-	// decided at creation from the schema's field types and is
-	// immutable afterwards.
+	// EngineBinding The engine this index is bound to: `native` (Lucenia's built-in
+	// engine) or `lucene` (the JVM engine). Binding is decided at
+	// creation from the schema's field types and is immutable afterwards.
 	EngineBinding *string     `json:"engine_binding,omitempty"`
 	Name          string      `json:"name"`
 	Schema        IndexSchema `json:"schema"`
+}
+
+// IndexPlacement How far an index's data may travel.
+//
+//   - `local`  — never leaves this node; no replicas anywhere.
+//   - `mesh`   — replicas only among this node's own mesh peers. The
+//     default. On a node whose scope is public there is no such thing as
+//     "our mesh peers", so this means only peers on the admission
+//     allowlist — which is what lets one node serve the public fabric while
+//     keeping a private index on its owner's own devices.
+//   - `public` — any peer, including strangers on the public fabric.
+type IndexPlacement string
+
+// IndexPolicy defines model for IndexPolicy.
+type IndexPolicy struct {
+	// EmbedderProfile Which embedder produced this index's vectors, e.g. `local_minilm:384`.
+	// READ-ONLY — it records what actually wrote the data, so it is not
+	// accepted on update. Absent means unknown, which is never to be read
+	// as "compatible".
+	EmbedderProfile *string `json:"embedder_profile,omitempty"`
+
+	// Placement How far an index's data may travel.
+	//
+	// * `local`  — never leaves this node; no replicas anywhere.
+	// * `mesh`   — replicas only among this node's own mesh peers. The
+	//   default. On a node whose scope is public there is no such thing as
+	//   "our mesh peers", so this means only peers on the admission
+	//   allowlist — which is what lets one node serve the public fabric while
+	//   keeping a private index on its owner's own devices.
+	// * `public` — any peer, including strangers on the public fabric.
+	Placement IndexPlacement `json:"placement"`
+
+	// ReplicationFactor Replicas wanted for this index. Absent means the node-wide default.
+	// Private memory wants 1-2 across its owner's devices; public-internet
+	// content needs far more to survive churn, and one node-wide number
+	// cannot serve both.
+	ReplicationFactor *int32 `json:"replication_factor,omitempty"`
+}
+
+// IndexPolicyUpdate A partial change. Omitted fields are left as they are.
+type IndexPolicyUpdate struct {
+	// Placement How far an index's data may travel.
+	//
+	// * `local`  — never leaves this node; no replicas anywhere.
+	// * `mesh`   — replicas only among this node's own mesh peers. The
+	//   default. On a node whose scope is public there is no such thing as
+	//   "our mesh peers", so this means only peers on the admission
+	//   allowlist — which is what lets one node serve the public fabric while
+	//   keeping a private index on its owner's own devices.
+	// * `public` — any peer, including strangers on the public fabric.
+	Placement         *IndexPlacement `json:"placement,omitempty"`
+	ReplicationFactor *int32          `json:"replication_factor,omitempty"`
 }
 
 // IndexSchema defines model for IndexSchema.
@@ -1815,7 +1917,7 @@ type SortClause0 = string
 // SortClause1 Geo-distance sort. Note the FLAT body — `field`/`lat`/`lon`, not a
 // nested point object.
 //
-// Engine support is not universal: the tantivy engine refuses this
+// Engine support is not universal: the native engine refuses this
 // with `400 unsupported_engine`. Where it IS served, ordering is
 // done by the serving engine and cannot be re-ordered by the
 // coordinator, so on an index with more than one claim the result is
@@ -2129,6 +2231,12 @@ type PutNamespaceKeyJSONBody struct {
 	Key string `json:"key"`
 }
 
+// NodeActivateEntitlementJSONBody defines parameters for NodeActivateEntitlement.
+type NodeActivateEntitlementJSONBody struct {
+	// Key The activation key, as pasted.
+	Key string `json:"key"`
+}
+
 // NodeStatus200JSONResponseBodyMode defines parameters for NodeStatus.
 type NodeStatus200JSONResponseBodyMode string
 
@@ -2136,6 +2244,21 @@ type NodeStatus200JSONResponseBodyMode string
 type CleanupRepositoryJSONBody struct {
 	// GraceSeconds Objects younger than this are kept. Default 86400.
 	GraceSeconds *int `json:"grace_seconds,omitempty"`
+}
+
+// SetBackupScheduleJSONBody defines parameters for SetBackupSchedule.
+type SetBackupScheduleJSONBody struct {
+	// Enabled Off without forgetting the settings; DELETE is the other verb.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// EveryHours One hour to one week. The floor is not taste: a backup has to finish before the next is due.
+	EveryHours int `json:"everyHours"`
+
+	// Prefix Leading component of each generated snapshot name. Lower-case letters, digits and '-' only — it becomes part of an object key, and a '/' would write the descriptor where neither a listing nor a retention rule scoped to `snapshots/` can see it.
+	Prefix *string `json:"prefix,omitempty"`
+
+	// Target The index to back up, as a manual snapshot names it.
+	Target string `json:"target"`
 }
 
 // CreateIndexJSONRequestBody defines body for CreateIndex for application/json ContentType.
@@ -2146,6 +2269,9 @@ type BulkIndexJSONRequestBody = BulkIndexRequest
 
 // IndexDocumentJSONRequestBody defines body for IndexDocument for application/json ContentType.
 type IndexDocumentJSONRequestBody = IndexDocumentRequest
+
+// PutIndexPolicyJSONRequestBody defines body for PutIndexPolicy for application/json ContentType.
+type PutIndexPolicyJSONRequestBody = IndexPolicyUpdate
 
 // SearchIndexJSONRequestBody defines body for SearchIndex for application/json ContentType.
 type SearchIndexJSONRequestBody = SearchRequest
@@ -2183,11 +2309,17 @@ type PutNamespaceMappingJSONRequestBody = IndexSchema
 // SearchNamespaceJSONRequestBody defines body for SearchNamespace for application/json ContentType.
 type SearchNamespaceJSONRequestBody = SearchRequest
 
+// NodeActivateEntitlementJSONRequestBody defines body for NodeActivateEntitlement for application/json ContentType.
+type NodeActivateEntitlementJSONRequestBody NodeActivateEntitlementJSONBody
+
 // RegisterRepositoryJSONRequestBody defines body for RegisterRepository for application/json ContentType.
 type RegisterRepositoryJSONRequestBody = RepositorySpec
 
 // CleanupRepositoryJSONRequestBody defines body for CleanupRepository for application/json ContentType.
 type CleanupRepositoryJSONRequestBody CleanupRepositoryJSONBody
+
+// SetBackupScheduleJSONRequestBody defines body for SetBackupSchedule for application/json ContentType.
+type SetBackupScheduleJSONRequestBody SetBackupScheduleJSONBody
 
 // CreateSnapshotJSONRequestBody defines body for CreateSnapshot for application/json ContentType.
 type CreateSnapshotJSONRequestBody = CreateSnapshotRequest
