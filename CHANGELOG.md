@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 — unreleased
+## v0.2.0 — 2026-10-09
 
 The GA surface. v0.1 wrapped index CRUD, documents, bulk, search and node
 status; v0.2 wraps everything a Gnarl customer is sold past search.
@@ -57,7 +57,9 @@ status; v0.2 wraps everything a Gnarl customer is sold past search.
 - `namespace_not_snapshottable` maps to `ErrConflict`, not `ErrUnsupported`.
   It means the namespace is mid-promotion: wait and retry.
 - The vendored description is the server's current one. Engine names in it
-  are now `native` and `lucene`.
+  are now `native` and `lucene`. A node released before the rename reports
+  the native engine as `tantivy`; `ListIndexes`, `ListIndexesPage` and
+  `Remember` translate it, so a caller sees one name whichever node answers.
 
 ### Fixed
 
