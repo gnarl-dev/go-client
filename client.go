@@ -143,6 +143,18 @@ func New(addr string, opts ...Option) (*Client, error) {
 //
 // out may be nil to discard the body. A non-2xx always yields an *Error.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.call(ctx, method, path, body, out, false)
+}
+
+// doRead is do for a POST that only reads — a search carries its query in a
+// body, but running it twice changes nothing.
+func (c *Client) doRead(ctx context.Context, path string, body, out any) error {
+	return c.call(ctx, http.MethodPost, path, body, out, true)
+}
+
+// call performs one request. idempotent records whether repeating it is safe.
+func (c *Client) call(ctx context.Context, method, path string, body, out any, idempotent bool) error {
+	_ = idempotent
 	var rdr io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
