@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.1 — 2026-10-11
+
+### Added
+
+- **`New("")` finds the Gnarly app on this machine.** With no address and no
+  `$GNARL_URL`, `New` reads the endpoint the local node recorded when it
+  started — `$LUCENIA_DATA_DIR/runtime/endpoint.json`, then
+  `~/.lucenia/runtime/endpoint.json` — and otherwise uses
+  `http://127.0.0.1:43300` (`DefaultLocalURL`). A recorded plain-HTTP endpoint
+  is used only on loopback, nothing is dialled at construction, and an https
+  address you configure is never downgraded. `EnvDataDir` names the variable.
+
+### Fixed
+
+- The README, package documentation and examples named port **8080**. A node's
+  default port is **43300**.
+- `New("")` with nothing configured no longer returns an error; it targets the
+  local node as above.
+- A recall in a namespace nothing was written to is pinned to decode when the
+  node omits `embedder` (nodes before this release did); `Embedder` is empty.
+
 ## v0.2.0 — 2026-10-09
 
 The GA surface. v0.1 wrapped index CRUD, documents, bulk, search and node
