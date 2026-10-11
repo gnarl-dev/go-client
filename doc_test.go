@@ -156,7 +156,7 @@ var (
 func main() {
 	ctx := context.Background()
 	_ = ctx
-	c, err := gnarl.New("http://localhost:8080")
+	c, err := gnarl.New("http://127.0.0.1:43300")
 	if err != nil {
 		log.Fatal(err)
 	}

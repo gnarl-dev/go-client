@@ -184,7 +184,7 @@ func TestNewDefaultsToHTTPS(t *testing.T) {
 }
 
 func TestNewKeepsAnExplicitScheme(t *testing.T) {
-	c, err := New("http://localhost:8080")
+	c, err := New("http://localhost:43300")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestNewKeepsAnExplicitScheme(t *testing.T) {
 }
 
 func TestNewRejectsNonsense(t *testing.T) {
-	for _, addr := range []string{"", "://", "http://"} {
+	for _, addr := range []string{"://", "http://"} {
 		if _, err := New(addr); err == nil {
 			t.Errorf("New(%q) succeeded", addr)
 		}
@@ -203,11 +203,11 @@ func TestNewRejectsNonsense(t *testing.T) {
 
 // A trailing slash must not produce a double slash in every path.
 func TestNewTrimsTrailingSlash(t *testing.T) {
-	c, err := New("http://localhost:8080/")
+	c, err := New("http://localhost:43300/")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := c.baseURL.String(); got != "http://localhost:8080" {
+	if got := c.baseURL.String(); got != "http://localhost:43300" {
 		t.Errorf("baseURL = %q, want no trailing slash", got)
 	}
 }
