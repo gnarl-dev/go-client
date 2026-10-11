@@ -4,16 +4,17 @@
 // so there is no cluster endpoint to point at: you talk to a node, and it
 // answers for the mesh. Any node will do.
 //
-//	// A node you started yourself serves https from a self-signed
-//	// certificate, so skip verification for it — and only for it.
-//	c, err := gnarl.New("https://localhost:8080", gnarl.WithInsecureSkipVerify())
+//	// "" finds the Gnarly app on this machine: $GNARL_URL, then the
+//	// endpoint the local node recorded, then http://127.0.0.1:43300.
+//	c, err := gnarl.New("")
 //	res, err := c.Search(ctx, "places", gnarl.SearchRequest{
 //	    Query: gnarl.GeoDistance("location", -33.8688, 151.2093, 1_000_000),
 //	})
 //
-// New("") reads the address from $GNARL_URL, and a client given no WithToken
-// reads $GNARL_TOKEN, so the same program runs against a laptop node and a
-// remote one without a code change.
+// New("") reads the address from $GNARL_URL — or, unset, finds the node on
+// this machine — and a client given no WithToken reads $GNARL_TOKEN, so the
+// same program runs against a laptop node and a remote one without a code
+// change.
 //
 // The payload types in internal/oas are generated from the node's OpenAPI
 // description and cannot drift from it. Everything in this package is written
@@ -40,7 +41,8 @@ const DefaultTimeout = 30 * time.Second
 
 // Environment variables New consults when the caller does not say.
 const (
-	// EnvURL is the node address New uses when given "".
+	// EnvURL is the node address New uses when given "". Unset, New finds
+	// the node on this machine instead.
 	EnvURL = "GNARL_URL"
 	// EnvToken is the bearer token used when no WithToken option is given.
 	EnvToken = "GNARL_TOKEN"
@@ -144,14 +146,16 @@ func WithUserAgent(ua string) Option {
 //
 // addr may omit the scheme, in which case https is assumed: a node serves TLS
 // by default, and defaulting to http would silently downgrade a caller who
-// wrote "search.example.com". An empty addr reads $GNARL_URL.
+// wrote "search.example.com".
+//
+// An empty addr finds a node in this order: $GNARL_URL; the endpoint the node
+// on this machine recorded in $LUCENIA_DATA_DIR/runtime/endpoint.json, then
+// ~/.lucenia/runtime/endpoint.json; and finally DefaultLocalURL, the Gnarly
+// app's loopback address. So New("") finds the Gnarly app on this machine with
+// no configuration. A recorded endpoint is used for plain HTTP only on
+// loopback, and an https address you configure is never downgraded.
 func New(addr string, opts ...Option) (*Client, error) {
-	if addr == "" {
-		addr = os.Getenv(EnvURL)
-	}
-	if addr == "" {
-		return nil, fmt.Errorf("gnarl: New: empty address, and $%s is not set", EnvURL)
-	}
+	addr = resolveAddr(addr)
 	if !strings.Contains(addr, "://") {
 		addr = "https://" + addr
 	}

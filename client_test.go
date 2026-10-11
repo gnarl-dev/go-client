@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -35,14 +34,6 @@ func TestNewReadsTheAddressAndTokenFromTheEnvironment(t *testing.T) {
 	_ = c.Ping(context.Background())
 	if auth != "" {
 		t.Errorf("WithToken(\"\") still sent %q", auth)
-	}
-}
-
-func TestNewWithNoAddressAnywhereNamesTheVariable(t *testing.T) {
-	t.Setenv(EnvURL, "")
-	_, err := New("")
-	if err == nil || !strings.Contains(err.Error(), EnvURL) {
-		t.Errorf("got %v; want an error naming $%s", err, EnvURL)
 	}
 }
 

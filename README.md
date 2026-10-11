@@ -31,7 +31,8 @@ import (
 )
 
 func main() {
-    c, err := gnarl.New("https://localhost:8080", gnarl.WithInsecureSkipVerify())
+    // "" finds the Gnarly app on this machine — no address to look up.
+    c, err := gnarl.New("")
     if err != nil {
         log.Fatal(err)
     }
@@ -158,11 +159,11 @@ you rather than shortened. Writes sent by POST are never repeated: a `503` does
 not prove the node did not apply them.
 
 ```go
-c, err := gnarl.New("https://localhost:8080",
+c, err := gnarl.New("",
     gnarl.WithRetry(gnarl.RetryPolicy{MaxAttempts: 5, BaseDelay: 100 * time.Millisecond, MaxDelay: 30 * time.Second}))
 _, _ = c, err
 
-noRetry, err := gnarl.New("https://localhost:8080", gnarl.WithoutRetry())
+noRetry, err := gnarl.New("", gnarl.WithoutRetry())
 _, _ = noRetry, err
 ```
 
@@ -303,10 +304,36 @@ if err != nil {
 _ = fromEnv
 ```
 
-**A node serves TLS by default.** `lucenia start` listens on **8080** over
-**https** with a self-signed certificate it generates on first run; `--no-tls`
-turns that off, and the desktop build uses it, but a node started with the plain
-command speaks https — which is why the quick start above says so.
+### `gnarl.New("")` finds the Gnarly app on this machine
+
+With no address, `New` looks in this order and takes the first it finds:
+
+1. the address you pass;
+2. `$GNARL_URL`;
+3. the endpoint the node on this machine recorded when it started, in
+   `$LUCENIA_DATA_DIR/runtime/endpoint.json`, then
+   `~/.lucenia/runtime/endpoint.json`;
+4. `http://127.0.0.1:43300` (`gnarl.DefaultLocalURL`), the Gnarly app's
+   address.
+
+The Gnarly desktop app serves plain HTTP on loopback, so `gnarl.New("")` just
+works against it. Discovery only reads files — it never dials — and it never
+downgrades: a recorded plain-HTTP endpoint is used only on loopback, and an
+https address you configure stays https. A scheme-less address is https.
+
+**A node started with `gnarl start` serves TLS.** It listens on **43300** over
+**https** with a self-signed certificate it generates on first run (`--no-tls`
+turns that off; the desktop app runs without it, on loopback). Discovery keeps
+certificate verification on for an https endpoint, so for a node you started
+yourself pass `gnarl.WithInsecureSkipVerify()`:
+
+```go
+mine, err := gnarl.New("https://127.0.0.1:43300", gnarl.WithInsecureSkipVerify())
+if err != nil {
+    return err
+}
+_ = mine
+```
 
 That certificate cannot be verified, because nothing signed it.
 `gnarl.WithInsecureSkipVerify()` is right for a node **you started yourself**
@@ -346,7 +373,7 @@ the conformance suite starts a real node and drives it:
 ```bash
 go test ./...                              # unit only; conformance skips
 GNARL_BINARY=/path/to/lucenia go test ./...  # starts a node, runs everything
-GNARL_TEST_NODE=https://localhost:8080 go test ./... # uses a node you have
+GNARL_TEST_NODE=http://127.0.0.1:43300 go test ./... # uses a node you have
 ```
 
 Writing this client found four defects in the API description on its first

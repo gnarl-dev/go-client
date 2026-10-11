@@ -182,3 +182,17 @@ func TestTheEngineIsCalledNativeWhicheverNodeAnswers(t *testing.T) {
 		t.Errorf("ListIndexesPage engines = %+v", got)
 	}
 }
+
+// A recall in a namespace nothing was ever written to: a node released before
+// v0.4.x answered without `embedder`. That body must decode, with Embedder
+// simply empty, rather than fail the call.
+func TestRecallInANeverWrittenNamespaceDecodesWithoutEmbedder(t *testing.T) {
+	c, _ := replying(t, 200, `{"namespace":"x","count":0,"memories":[]}`)
+	r, err := c.Recall(context.Background(), RecallRequest{Query: "anything"})
+	if err != nil {
+		t.Fatalf("a recall with no embedder in the answer failed: %v", err)
+	}
+	if r.Namespace != "x" || r.Count != 0 || len(r.Memories) != 0 || r.Embedder != "" {
+		t.Errorf("decoded %+v", r)
+	}
+}
